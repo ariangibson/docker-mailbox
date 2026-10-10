@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.4.16
+
+Documentation only. The README's agent integrations section names [peen](https://github.com/psyb0t/peen) as an example of an agent that reads `.agents/skills/`.
+
 ## v0.4.15
 
 Fixes the documented `/mcp` endpoint for Streamable HTTP clients that do not

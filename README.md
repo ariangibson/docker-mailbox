@@ -146,7 +146,7 @@ Everything's JSON. Errors look like `{"detail": "..."}`:
 ### `GET /health`
 
 ```json
-{ "ok": true, "version": "0.4.15" }
+{ "ok": true, "version": "0.4.16" }
 ```
 
 Always open, no bearer required. Point your liveness probe at this and forget about it.
@@ -305,7 +305,7 @@ Drop the `headers` block if you're running without `auth.tokens`. Keep it if you
 
 ## Agent integrations
 
-The [skill](.agents/skills/docker-mailbox) works in any agent that reads `.agents/skills/`, and installs natively in the clients below.
+The [skill](.agents/skills/docker-mailbox) works in any agent that reads `.agents/skills/` (such as [peen](https://github.com/psyb0t/peen)), and installs natively in the clients below.
 
 ### Claude Code
 
