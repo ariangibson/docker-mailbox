@@ -83,6 +83,7 @@ config.example.yaml
 # Secrets / runtime config — must NEVER end up in the image
 .env
 .env.*
+*.env
 .envrc
 config.yaml
 config.yml

@@ -52,6 +52,7 @@ CODEX.local.md
 PLAN.md
 implplan.md
 NOTES.md
+STATUS.md
 TODO.md
 WIP.md
 *.local
@@ -71,6 +72,7 @@ pyrightconfig.json
 # Env files
 .env
 .env.*
+*.env
 .envrc
 
 # Credential material — defence in depth

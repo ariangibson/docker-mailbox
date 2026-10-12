@@ -21,6 +21,7 @@ paths = [
   '''(^|/)PLAN\.md$''',
   '''(^|/)implplan\.md$''',
   '''(^|/)NOTES\.md$''',
+  '''(^|/)STATUS\.md$''',
   '''(^|/)TODO\.md$''',
   '''(^|/)WIP\.md$''',
   '''(^|/)\.agent_(notes|knowledge)(/|$)''',
