@@ -1,5 +1,89 @@
 # Changelog
 
+## Unreleased
+
+Drafts, threaded replies, catch-all address handling, a sender allow-list, and
+configuration from environment variables.
+
+**Behavior changes:**
+
+- The server no longer starts without bearer tokens. A config with an empty
+  or missing `auth.tokens` used to run unauthenticated; it now exits with an
+  error unless `MAILBOX_ALLOW_NO_AUTH=true` is set.
+- `${NAME}` inside a `config.yaml` string is now an environment-variable
+  reference. A value that contains those characters literally (a password,
+  say) must write them as `$${NAME}`.
+- TLS certificates are now verified (see Security below). A mail server with
+  a self-signed certificate needs `tls_verify: false`.
+- `delete_message` takes one UID. It used to accept IMAP sequence-sets, so a
+  single call with `1:*` permanently emptied a folder.
+
+**Security:**
+
+- **IMAP and SMTP connections did not verify the server's TLS certificate.**
+  `imaplib` and `smtplib` default to an unverified context, and nothing here
+  passed one, so anyone on the network path could impersonate the mail server
+  and capture the password and the mail. Connections now use a verifying
+  context; `tls_verify: false` (or `MAILBOX_<NAME>_IMAP_TLS_VERIFY` /
+  `_SMTP_TLS_VERIFY`) opts out per mailbox.
+- A bearer header containing non-ASCII bytes raised inside the auth check and
+  returned `500`; it now returns `401` like any other bad token.
+
+- **Drafts.** `save_draft`, `list_drafts`, `get_draft`, `update_draft`,
+  `delete_draft` and `send_draft`, as MCP tools and under
+  `/mailboxes/{name}/drafts`. Drafts are appended to the folder flagged
+  SPECIAL-USE `\Drafts` (then `imap.drafts_folder`, then `Drafts`) with the
+  `\Draft` flag; the new UID comes from `APPENDUID`, or a Message-ID search on
+  servers without UIDPLUS. An update appends the new version before deleting
+  and expunging the old UID. `send_draft` sends the saved bytes minus `Bcc`.
+- **Threading.** `send` accepts `in_reply_to` and `references`. New `reply`
+  tool / `POST /mailboxes/{name}/messages/{uid}/reply` derives recipient
+  (`Reply-To`, else `From`), a single `Re:` subject, `In-Reply-To` and
+  `References` from the original, and can save the reply as a draft.
+  Message-IDs longer than 78 characters are no longer RFC 2047-encoded in
+  those headers (a stdlib folding quirk that breaks threading).
+- **Sent copies.** Every sent message is appended to the folder flagged
+  SPECIAL-USE `\Sent` (then `imap.sent_folder`, then `Sent`). Opt out per
+  mailbox with `imap.save_sent: false`. A failed copy is reported in
+  `warnings` rather than failing a send that already went out.
+- **Catch-all mailboxes.** `get_message` also returns `delivered_to`,
+  `x_original_to`, `envelope_to`, `in_reply_to`, `references`, `bcc`,
+  `reply_to`, and a computed `received_for`: the first address on the
+  mailbox's domain in Delivered-To, X-Original-To, Envelope-To, To, Cc. The
+  login address is passed over in the delivery headers when something more
+  specific follows, but wins when To / Cc name it directly, and only the
+  topmost delivery header is trusted — so a shared domain doesn't get a
+  colleague's address. `reply` sends from it by default.
+- **`allowed_from`.** Optional per-mailbox list of permitted From addresses
+  (`*` wildcard). `send`, `reply` and `send_draft` refuse anything else with
+  `403`.
+- **Environment configuration.** `config.yaml` is optional. Each
+  `MAILBOX_<NAME>=<provider>:<username>:<password>` variable defines a mailbox
+  from a provider preset (`purelymail`, `gmail`, `fastmail`, `outlook`, or a
+  custom `MAILBOX_PROVIDER_<NAME>_*` one), with `MAILBOX_<NAME>_<SETTING>`
+  overrides and the globals `MAILBOX_AUTH_TOKENS`, `MAILBOX_ALLOW_NO_AUTH`,
+  `MAILBOX_LOG_LEVEL` and `MAILBOX_PORT`. Environment values override the
+  file. String values in `config.yaml` may reference `${VAR}`.
+- **Startup.** The container now starts through `mailboxd http`, which
+  validates the configuration first and exits with a one-line error naming
+  the setting at fault; previously a bad config crash-looped the uvicorn
+  workers. Configuration errors no longer echo configured values (pydantic's
+  default message printed the mailbox mapping, password included).
+- **CI.** New `ci` workflow: lint + tests on every push and pull request, then
+  an image build that is booted and smoke-tested, published to
+  `ghcr.io/<owner>/<repo>` (`latest`, `main`, `sha-<commit>`, and version tags)
+  for amd64 and arm64 on pushes to `main`. The upstream project's workflows
+  (Docker Hub, mirrors, registry publishing) are now skipped outside the
+  upstream repository.
+- **`GET /health/detail`** (authenticated) logs in to every account's IMAP and
+  SMTP server and reports which succeeded.
+- IMAP connections now time out after 30 seconds, and connection and protocol
+  errors raised by `imaplib` surface as `502` instead of an unhandled `500`.
+  Header values containing a line break are rejected with `422`. Non-ASCII
+  folder names are encoded as modified UTF-7 instead of crashing.
+- UID validation used `$`, which accepts a trailing newline; `"7\n"` reached
+  the IMAP command line. It now requires a full match.
+
 ## v0.4.16
 
 Documentation only. The README's agent integrations section names [peen](https://github.com/psyb0t/peen) as an example of an agent that reads `.agents/skills/`.

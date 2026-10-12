@@ -12,7 +12,7 @@
 git clone https://github.com/psyb0t/docker-mailbox
 cd docker-mailbox
 cp config.example.yaml config.yaml
-# Edit config.yaml — add your mailboxes and (optionally) auth.tokens
+# Edit config.yaml — add your mailboxes and auth.tokens
 ```
 
 Then either:
@@ -21,7 +21,7 @@ Then either:
 # Plain docker run
 docker run --rm -p 8000:8000 \
   -v "$PWD/config.yaml:/etc/mailboxd/config.yaml:ro" \
-  psyb0t/mailbox:latest
+  ghcr.io/ariangibson/docker-mailbox:latest
 
 # Or docker compose (recommended)
 docker compose up -d
@@ -32,7 +32,23 @@ Verify it came up:
 ```bash
 curl -s http://localhost:8000/health
 # {"ok": true, "version": "..."}
+
+# and that every account can actually log in
+curl -s -H "Authorization: Bearer $MAILBOX_TOKEN" http://localhost:8000/health/detail
 ```
+
+### No config file: environment variables only
+
+The server can be configured entirely from `MAILBOX_*` variables — one per account, `MAILBOX_<NAME>=<provider>:<username>:<password>`:
+
+```bash
+docker run --rm -p 8000:8000 \
+  -e MAILBOX_AUTH_TOKENS="$(openssl rand -hex 32)" \
+  -e MAILBOX_PERSONAL='gmail:me@gmail.com:app-password-here' \
+  ghcr.io/ariangibson/docker-mailbox:latest
+```
+
+Built-in providers: `purelymail`, `gmail`, `fastmail`, `outlook`; others via `MAILBOX_PROVIDER_<NAME>_IMAP_HOST` / `_SMTP_HOST` (plus `_PORT` / `_TLS`). Per-account overrides (`MAILBOX_<NAME>_FROM_ADDRESS`, `_ALLOWED_FROM`, `_IMAP_HOST`, …), the full variable list and a compose example are in the [README](https://github.com/psyb0t/docker-mailbox#environment-only-configuration). A mounted `config.yaml` still loads; the environment overrides it.
 
 ## Configuration
 
@@ -43,7 +59,8 @@ One YAML file. Lives at `MAILBOXD_CONFIG`, or `--config`, or `/etc/mailboxd/conf
 ```yaml
 log_level: INFO
 
-# Bearer-token gate. Guards the HTTP API AND /mcp. Empty / missing = no auth.
+# Bearer-token gate. Guards the HTTP API AND /mcp. Required: with no tokens
+# the server won't start unless MAILBOX_ALLOW_NO_AUTH=true is set.
 # Multi-token list = rotate without downtime: add a new one, swap clients
 # over, retire the old one.
 auth:
@@ -80,9 +97,11 @@ mailboxes:
 
 - **At least one mailbox** is required.
 - Each mailbox must declare at least one of `imap` / `smtp`. Both is fine. Neither is a config error.
-- **`name`** is the URL path segment AND the MCP tool prefix. Matches `[a-zA-Z0-9_-]+`. Must be unique across the file.
+- **`name`** is the URL path segment AND what MCP tools take as `mailbox`. Matches `[a-zA-Z0-9_-]+`. Must be unique across the file.
 - **Defaults**: IMAP `993/ssl`, SMTP `587/starttls`. Override per-mailbox if your provider is weird.
-- **The config file holds plaintext passwords and your bearer tokens.** Treat it like a credential vault: gitignore it (the repo already does), `chmod 600`, mount read-only into the container, don't paste it in chat.
+- **TLS certificates are verified** for IMAP and SMTP. For a self-signed server on a trusted network set `tls_verify: false` under `imap` / `smtp` (env: `MAILBOX_<NAME>_IMAP_TLS_VERIFY=false`).
+- **Optional per-mailbox keys**: `allowed_from` (list of From addresses the mailbox may send as, `*` wildcard; other senders get `403`), and under `imap`: `drafts_folder` / `sent_folder` (fallbacks for servers without SPECIAL-USE folder flags) and `save_sent` (default `true`; set `false` on Gmail/Outlook, which file sent mail themselves).
+- **The config file holds plaintext passwords and your bearer tokens.** Treat it like a credential vault: gitignore it (the repo already does), `chmod 600`, mount read-only into the container, don't paste it in chat. Or keep secrets out of it: any string value may be `"${ENV_VAR}"`, or skip the file and use `MAILBOX_*` variables.
 
 ### Provider quick-reference
 
@@ -108,10 +127,10 @@ That's it. One port, one process, two surfaces sharing the same bearer-auth gate
 
 ## Auth
 
-When `auth.tokens` is configured, every request except `GET /health` must carry:
+Every request except `GET /health` must carry one of the server's tokens (`MAILBOX_AUTH_TOKENS`, comma-separated, or `auth.tokens` in the config file):
 
 ```
-Authorization: Bearer <one of auth.tokens>
+Authorization: Bearer <token>
 ```
 
 - Missing / malformed / wrong token → `401` with `WWW-Authenticate: Bearer`.
@@ -119,7 +138,7 @@ Authorization: Bearer <one of auth.tokens>
 - The same gate covers `/mcp` — there's no second auth system to learn.
 - Multiple tokens in the list let you rotate without downtime: add the new one, switch clients over, remove the old one.
 
-When `auth.tokens` is empty / omitted, all endpoints are open. Fine for "this is bound to `127.0.0.1` and there's a reverse proxy in front." Catastrophic otherwise.
+With no tokens configured the server refuses to start. Setting `MAILBOX_ALLOW_NO_AUTH=true` overrides that and leaves all endpoints open. Fine for "this is bound to `127.0.0.1` and there's a reverse proxy in front." Catastrophic otherwise.
 
 ## Management
 
@@ -185,7 +204,7 @@ Add a sidecar to `docker-compose.yml`:
 ```yaml
 services:
   mailbox:
-    image: psyb0t/mailbox:latest
+    image: ghcr.io/ariangibson/docker-mailbox:latest
     volumes:
       - ./config.yaml:/etc/mailboxd/config.yaml:ro
     # no `ports:` — only cloudflared reaches it
@@ -208,12 +227,16 @@ Note: Cloudflare's free Universal SSL covers `*.yourdomain.com` but not deeper s
 | Symptom                                                  | Likely cause                                                                                              |
 | -------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
 | `401 missing or invalid Bearer token`                    | Forgot `-H "Authorization: Bearer ..."` or token doesn't match anything in `auth.tokens`.                  |
+| `502 connection failed: ... CERTIFICATE_VERIFY_FAILED`   | The mail server's certificate isn't trusted or doesn't match the host name. Fix the host name; for a self-signed server see `tls_verify`. |
 | `502 login failed`                                       | Wrong password OR you used your account password instead of an app password (Gmail/Yahoo/iCloud/Outlook).  |
 | `502 [AUTHENTICATIONFAILED] LOGIN Invalid credentials`   | Yahoo: app passwords are **16 lowercase letters**. If yours has digits/symbols/caps, it's the wrong one.   |
 | `409 mailbox 'X' has no imap configured`                 | You called an IMAP endpoint on an SMTP-only mailbox (or vice versa). Check `/mailboxes` for capabilities.  |
-| `404 unknown mailbox`                                    | Mailbox `name` in the URL doesn't match anything in `config.yaml`.                                         |
+| `404 unknown mailbox`                                    | Mailbox `name` in the URL doesn't match anything in `config.yaml` / no `MAILBOX_<NAME>` variable defines it. |
+| `403 ... not permitted by this mailbox's allowed_from`   | The From address isn't on the mailbox's `allowed_from` list. Env-defined accounts default to `*@<their domain>`. |
 | Self-send lands in Spam (especially GMX)                 | Provider-side self-send heuristic — search `folder=Spam`. Not a mailboxd bug; the headers are well-formed. |
-| Container won't start, `config not found: ...`           | Your config mount didn't land at `/etc/mailboxd/config.yaml`. Check the volume path.                       |
-| `config ... invalid: ...` on startup                     | Pydantic validation failure — read the message, it points at the bad field.                                |
+| Container won't start, `config not found: ...`           | No config file at `/etc/mailboxd/config.yaml` and no `MAILBOX_<NAME>` account variables. Check the volume path or the environment. |
+| Container exits with `mailboxd: MAILBOX_...: ...`        | That variable is malformed — the message says how. Values (passwords) are never printed.                   |
+| Container exits with `no bearer tokens configured`       | Set `MAILBOX_AUTH_TOKENS` (or `auth.tokens`), or `MAILBOX_ALLOW_NO_AUTH=true` to run open on purpose.       |
+| `config invalid: ...` on startup                         | Validation failure — the message names the mailbox and the bad field.                                      |
 | MCP client gets `Task group is not initialized`          | Server isn't fully started yet (lifespan hasn't completed). Retry after a moment.                          |
 | `/inbox` `errors` array has entries                      | Those mailboxes failed to connect/auth. The rest still returned results — check the per-mailbox `error`.   |

@@ -1,5 +1,8 @@
 # mailboxd config — one entry per mailbox you want to control.
 #
+# This file is optional: the same things can be set with MAILBOX_* environment
+# variables (see the README), which also override whatever is written here.
+#
 # Each mailbox can declare any combination of:
 #   - imap: for reading / listing / deleting messages
 #   - smtp: for sending
@@ -10,11 +13,16 @@
 log_level: INFO
 
 # Bearer-token auth — applies to ALL non-/health endpoints (HTTP API + the
-# /mcp streamable-HTTP transport). Leave `tokens` empty / omit the block to
-# disable auth entirely.
+# /mcp streamable-HTTP transport). With no tokens the server refuses to start
+# unless MAILBOX_ALLOW_NO_AUTH=true is set in its environment.
+#
+# Any string value in this file may reference an environment variable as
+# "${VAR}" (or "${VAR:-default}") to keep secrets out of it. Don't use names
+# starting with MAILBOX_ for those — that prefix is scanned for accounts.
 auth:
   tokens:
     - "replace-with-a-long-random-token"
+    # - "${API_TOKEN}"
     # - "second-token-for-rotation"
 
 mailboxes:
@@ -28,6 +36,7 @@ mailboxes:
       username: me@gmail.com
       password: "app-password-here"
       default_folder: INBOX
+      save_sent: false      # Gmail files sent mail in Sent itself
 
     smtp:
       host: smtp.gmail.com
@@ -40,17 +49,30 @@ mailboxes:
   - name: work
     description: "Work mailbox over IMAP+SMTP"
 
+    # Optional. The only From addresses this mailbox may send as; anything else
+    # is refused. `*` is a wildcard. Omit to leave it unrestricted.
+    allowed_from:
+      - "*@example.com"
+
     imap:
       host: mail.example.com
       port: 143
       tls: starttls
+      # tls_verify: false   # only for a self-signed certificate on a network you trust
       username: me@example.com
-      password: "secret"
+      password: "${WORK_PASSWORD}"
+      # Optional. Drafts / Sent are found through the server's SPECIAL-USE
+      # flags; these names are only used when it has none (then "Drafts"/"Sent").
+      # drafts_folder: Drafts
+      # sent_folder: Sent
+      # Optional, default true: append a copy of every sent message to Sent.
+      # Set false for Gmail / Outlook, which file sent mail themselves.
+      # save_sent: true
 
     smtp:
       host: mail.example.com
       port: 587
       tls: starttls
       username: me@example.com
-      password: "secret"
+      password: "${WORK_PASSWORD}"
       from_address: me@example.com

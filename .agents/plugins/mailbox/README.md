@@ -20,7 +20,9 @@ The docker-mailbox MCP tools become available to your agent: `mailboxes`
 (discovery), `inbox` (unified newest-first read across every configured IMAP
 mailbox), `list_folders`, `list_messages`, `search` (structured single-mailbox
 search), `get_message` (with optional `reader` mode — HTML stripped to clean
-markdown), `delete_message`, `mark_seen`, and `send`. Every per-mailbox tool
+markdown), `delete_message`, `mark_seen`, `send`, `reply` (threaded, optionally
+saved as a draft), and the drafts tools `save_draft`, `list_drafts`,
+`get_draft`, `update_draft`, `delete_draft` and `send_draft`. Every per-mailbox tool
 takes a `mailbox` argument (the configured name or its email address), so the
 tool catalog stays constant-sized no matter how many mailboxes are configured.
 
