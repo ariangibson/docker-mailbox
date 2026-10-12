@@ -48,6 +48,12 @@ def _session(cfg: SmtpConfig, doing: str = "send") -> Iterator[smtplib.SMTP]:
         raise SmtpError(f"{doing} failed: {detail}") from None
 
 
+def check_login(cfg: SmtpConfig) -> None:
+    """Connect and authenticate, nothing more. Raises `SmtpError` on failure."""
+    with _session(cfg, doing="login"):
+        pass
+
+
 def send_message(cfg: SmtpConfig, msg: Message, to_addrs: list[str]) -> None:
     """Send a message we built. smtplib drops the Bcc header on the way out."""
     with _session(cfg) as s:

@@ -126,6 +126,12 @@ def _connect(cfg: ImapConfig) -> Iterator[imaplib.IMAP4]:
             pass
 
 
+def check_login(cfg: ImapConfig) -> None:
+    """Connect and log in, nothing more. Raises `ImapError` / `OSError` on failure."""
+    with _connect(cfg):
+        pass
+
+
 def _mutf7(name: str) -> str:
     """A mailbox name in IMAP's modified UTF-7 (RFC 3501 §5.1.3)."""
     out: list[str] = []

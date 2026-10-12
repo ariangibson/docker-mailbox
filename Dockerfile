@@ -51,6 +51,9 @@ USER mailboxd
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)" || exit 1
+    CMD python -c "import os,urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:%s/health' % (os.environ.get('MAILBOX_PORT') or '8000')).status==200 else 1)" || exit 1
 
-CMD ["sh", "-c", "uvicorn --factory mailboxd.server:create_app --host 0.0.0.0 --port 8000 --workers ${WORKERS}"]
+# The CLI checks the configuration before starting uvicorn, so a bad setting
+# exits with a one-line error instead of crash-looping the workers. It binds
+# 0.0.0.0 and reads MAILBOX_PORT (default 8000) and WORKERS.
+CMD ["mailboxd", "http"]

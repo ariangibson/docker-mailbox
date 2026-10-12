@@ -20,7 +20,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Run the FastAPI HTTP server (also serves MCP under /mcp)",
     )
     p_http.add_argument("--host", default="0.0.0.0")
-    p_http.add_argument("--port", type=int, default=8000)
+    p_http.add_argument("--port", type=int, default=os.environ.get("MAILBOX_PORT") or "8000")
     p_http.add_argument("--workers", type=int, default=int(os.environ.get("WORKERS", "1")))
     p_http.add_argument("--config", help="Path to config.yaml (overrides MAILBOXD_CONFIG)")
 
@@ -30,6 +30,16 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["MAILBOXD_CONFIG"] = args.config
 
     if args.mode == "http":
+        # Validate here, in the parent: with --workers, uvicorn restarts a
+        # worker that dies on a bad config forever instead of exiting.
+        from .config import ConfigError, load_config
+
+        try:
+            load_config()
+        except ConfigError as e:
+            print(f"mailboxd: {e}", file=sys.stderr)
+            return 2
+
         import uvicorn
 
         uvicorn.run(

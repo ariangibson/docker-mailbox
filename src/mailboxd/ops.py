@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import email
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from email.message import Message
 from email.utils import formatdate, getaddresses, make_msgid
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
-from . import imap_client, smtp_client
-from .config import MailboxConfig
+from . import __version__, imap_client, smtp_client
+from .config import Config, MailboxConfig
+from .imap_client import ImapError
 from .message import (
     MessageError,
     address_of,
@@ -93,6 +95,40 @@ def _file_sent(mb: MailboxConfig, raw: bytes) -> dict[str, Any]:
             "warnings": [f"message was sent, but saving a copy to Sent failed: {e}"],
         }
     return {"saved_to_sent": True, "sent_folder": folder}
+
+
+def health_detail(cfg: Config) -> dict[str, Any]:
+    """Log in to every account's IMAP and SMTP server and report what worked.
+
+    `imap_login` / `smtp_login` are true or false, or None for a protocol the
+    account doesn't have. Accounts are probed in parallel.
+    """
+
+    def _probe(proto: str, check: Callable[[], None]) -> dict[str, Any]:
+        try:
+            check()
+        except (ImapError, SmtpError, OSError) as e:
+            return {f"{proto}_login": False, f"{proto}_error": str(e)}
+        return {f"{proto}_login": True}
+
+    def _one(mb: MailboxConfig) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "name": mb.name,
+            "provider": mb.provider,
+            "imap_login": None,
+            "smtp_login": None,
+        }
+        imap, smtp = mb.imap, mb.smtp
+        if imap is not None:
+            out.update(_probe("imap", lambda: imap_client.check_login(imap)))
+        if smtp is not None:
+            out.update(_probe("smtp", lambda: smtp_client.check_login(smtp)))
+        return out
+
+    with ThreadPoolExecutor(max_workers=max(1, len(cfg.mailboxes))) as ex:
+        accounts = list(ex.map(_one, cfg.mailboxes))
+    ok = all(a[key] is not False for a in accounts for key in ("imap_login", "smtp_login"))
+    return {"ok": ok, "version": __version__, "accounts": accounts}
 
 
 def get_message(

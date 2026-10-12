@@ -2,6 +2,7 @@
 
 URL shape:
   GET    /health
+  GET    /health/detail                               per-account login check (needs auth)
   GET    /mailboxes
   GET    /inbox                                       unified across all IMAP mailboxes
          ?mailbox=name1,addr@x  ← optional filter (name or email address)
@@ -189,6 +190,17 @@ def create_app(config: Config | None = None) -> FastAPI:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
+    for m in cfg.mailboxes:
+        log.info(
+            "mailbox %s: provider=%s imap=%s smtp=%s",
+            m.name,
+            m.provider or "-",
+            m.imap.host if m.imap is not None else "-",
+            m.smtp.host if m.smtp is not None else "-",
+        )
+    if not cfg.auth.tokens:
+        log.warning("no bearer tokens configured: the API and /mcp are UNAUTHENTICATED")
+
     mcp_manager = build_session_manager(cfg)
 
     @contextlib.asynccontextmanager
@@ -211,6 +223,10 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.get("/health", response_model=HealthResponse)
     def health() -> dict[str, Any]:
         return {"ok": True, "version": __version__}
+
+    @app.get("/health/detail")
+    def health_detail() -> dict[str, Any]:
+        return ops.health_detail(cfg)
 
     @app.get("/mailboxes", response_model=MailboxList)
     def list_mailboxes() -> MailboxList:

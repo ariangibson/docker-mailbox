@@ -6,6 +6,10 @@ URL-safe (it becomes a path segment in the HTTP API).
 
 String values may reference environment variables as `${VAR}` (or
 `${VAR:-default}`), so passwords and tokens can stay out of the file.
+
+The file is optional: `MAILBOX_*` environment variables can define the whole
+configuration, and override the file where both are present (see
+`env_config`).
 """
 
 from __future__ import annotations
@@ -18,6 +22,8 @@ from typing import Any, Literal, Mapping
 
 import yaml
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+
+from . import env_config
 
 DEFAULT_CONFIG_PATH = "/etc/mailboxd/config.yaml"
 _NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
@@ -56,6 +62,8 @@ class SmtpConfig(BaseModel):
 class MailboxConfig(BaseModel):
     name: str
     description: str = ""
+    # Preset an env-defined mailbox was built from; informational only.
+    provider: str | None = None
     imap: ImapConfig | None = None
     smtp: SmtpConfig | None = None
     # From addresses this mailbox may send as; `*` is a wildcard
@@ -87,7 +95,11 @@ class MailboxConfig(BaseModel):
 
 
 class AuthConfig(BaseModel):
-    """Bearer-token auth. Empty `tokens` list disables auth entirely."""
+    """Bearer-token auth. Empty `tokens` list disables auth entirely.
+
+    `load_config` refuses to produce that state unless
+    `MAILBOX_ALLOW_NO_AUTH=true` says it is intended.
+    """
 
     tokens: list[str] = Field(default_factory=list)
 
@@ -225,13 +237,27 @@ def _describe(e: ValidationError, raw: Mapping[str, Any]) -> str:
 
 
 def load_config(path: str | None = None, environ: Mapping[str, str] | None = None) -> Config:
+    """Load the config file (if there is one) with `MAILBOX_*` variables laid over it."""
     env = os.environ if environ is None else environ
     cfg_path = path or env.get("MAILBOXD_CONFIG") or DEFAULT_CONFIG_PATH
     p = Path(cfg_path)
-    if not p.is_file():
-        raise ConfigError(f"config not found: {cfg_path}")
-    raw = _load_file(p, env)
+    has_file = p.is_file()
     try:
-        return Config.model_validate(raw)
+        raw, allow_no_auth = env_config.overlay(_load_file(p, env) if has_file else {}, env)
+    except env_config.EnvError as e:
+        raise ConfigError(str(e)) from None
+    if not has_file and not raw["mailboxes"]:
+        raise ConfigError(
+            f"config not found: {cfg_path} — mount a config file there, or define accounts "
+            f"with {env_config.PREFIX}<NAME>={env_config.ACCOUNT_FORMAT}"
+        )
+    try:
+        cfg = Config.model_validate(raw)
     except ValidationError as e:
-        raise ConfigError(f"config {cfg_path} invalid: {_describe(e, raw)}") from None
+        raise ConfigError(f"config invalid: {_describe(e, raw)}") from None
+    if not cfg.auth.tokens and not allow_no_auth:
+        raise ConfigError(
+            "no bearer tokens configured: set MAILBOX_AUTH_TOKENS (or auth.tokens in the "
+            "config file), or set MAILBOX_ALLOW_NO_AUTH=true to run without authentication"
+        )
+    return cfg
