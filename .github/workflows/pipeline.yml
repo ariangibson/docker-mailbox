@@ -4,6 +4,9 @@ on: [push]
 
 jobs:
   code:
+    # Upstream's own infrastructure; inert in forks (see ci.yml for this fork's CI).
+    # Every other job needs this one, so skipping it skips the whole pipeline.
+    if: github.repository_owner == 'psyb0t'
     permissions:
       contents: read
       security-events: write # for the sec SARIF upload

@@ -10,6 +10,8 @@ on:
 
 jobs:
   issue-pull:
+    # Upstream's own infrastructure; inert in forks (see ci.yml for this fork's CI).
+    if: github.repository_owner == 'psyb0t'
     permissions:
       issues: write
     uses: psyb0t/reusable-github-workflows/.github/workflows/issue-pull.yml@master

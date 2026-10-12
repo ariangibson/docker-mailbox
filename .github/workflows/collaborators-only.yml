@@ -6,6 +6,8 @@ on:
 
 jobs:
   call-collaborators-only-workflow:
+    # Upstream's own infrastructure; inert in forks (see ci.yml for this fork's CI).
+    if: github.repository_owner == 'psyb0t'
     uses: psyb0t/reusable-github-workflows/.github/workflows/collaborators-only-workflow.yml@master
     with:
       close_message: "No PRs. Open an issue and I'll review it."
