@@ -70,6 +70,31 @@ class SendRequest(BaseModel):
     bcc: list[str] | None = None
     from_address: str | None = None
     reply_to: str | None = None
+    in_reply_to: str | None = None
+    # Header-style string ("<a@x> <b@y>") or a list of Message-IDs.
+    references: str | list[str] | None = None
+
+
+class DraftRequest(BaseModel):
+    """Body for creating a draft, and for updating one (omitted field = keep)."""
+
+    to: list[str] | None = None
+    subject: str | None = None
+    body_text: str | None = None
+    body_html: str | None = None
+    cc: list[str] | None = None
+    bcc: list[str] | None = None
+    from_address: str | None = None
+    reply_to: str | None = None
+    in_reply_to: str | None = None
+    references: str | list[str] | None = None
+
+
+class ReplyRequest(BaseModel):
+    body_text: str | None = None
+    body_html: str | None = None
+    from_address: str | None = None
+    draft: bool = False
 
 
 class SendResponse(BaseModel):

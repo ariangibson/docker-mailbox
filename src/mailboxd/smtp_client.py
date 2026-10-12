@@ -2,69 +2,35 @@
 
 from __future__ import annotations
 
+import base64
 import smtplib
-from email.message import EmailMessage
-from email.utils import formatdate, make_msgid
-from typing import Iterable
+from contextlib import contextmanager
+from email.message import Message
+from typing import Iterator
 
-from .config import SmtpConfig
+from .config import SmtpConfig, redact
 
 
 class SmtpError(Exception):
     """Raised when an SMTP send fails."""
 
 
-def send(
-    cfg: SmtpConfig,
-    to: Iterable[str],
-    subject: str,
-    body_text: str | None = None,
-    body_html: str | None = None,
-    cc: Iterable[str] | None = None,
-    bcc: Iterable[str] | None = None,
-    from_address: str | None = None,
-    reply_to: str | None = None,
-) -> dict[str, str]:
-    to_list = list(to)
-    if not to_list:
-        raise SmtpError("`to` must contain at least one address")
-    if body_text is None and body_html is None:
-        raise SmtpError("must supply body_text and/or body_html")
+def _login(s: smtplib.SMTP, cfg: SmtpConfig) -> None:
+    try:
+        s.login(cfg.username, cfg.password)
+    except UnicodeError:
+        raise smtplib.SMTPException(
+            "the username or password has non-ASCII characters, which SMTP AUTH cannot carry"
+        ) from None
 
-    sender = from_address or cfg.from_address
-    msg = EmailMessage()
-    msg["From"] = sender
-    msg["To"] = ", ".join(to_list)
-    msg["Subject"] = subject
-    msg["Date"] = formatdate(localtime=True)
-    # Derive the Message-ID domain from the sender so it matches the From: header —
-    # mismatched Message-ID domains are a strong spam signal.
-    sender_domain = sender.split("@")[-1].strip(">").strip() if "@" in sender else None
-    msg["Message-ID"] = make_msgid(domain=sender_domain) if sender_domain else make_msgid()
-    # Masquerade as Thunderbird — providers' spam heuristics treat unknown/missing
-    # User-Agent as suspicious; a well-known MUA string is a mild positive signal.
-    msg["User-Agent"] = (
-        "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Thunderbird/128.5.0"
-    )
-    if cc:
-        msg["Cc"] = ", ".join(cc)
-    if reply_to:
-        msg["Reply-To"] = reply_to
 
-    if body_text is not None:
-        msg.set_content(body_text)
-    if body_html is not None:
-        if body_text is None:
-            msg.set_content("This message requires an HTML-capable client.")
-        msg.add_alternative(body_html, subtype="html")
-
-    rcpts = to_list + list(cc or []) + list(bcc or [])
-
+@contextmanager
+def _session(cfg: SmtpConfig, doing: str = "send") -> Iterator[smtplib.SMTP]:
     try:
         if cfg.tls == "ssl":
             with smtplib.SMTP_SSL(cfg.host, cfg.port, timeout=30) as s:
-                s.login(cfg.username, cfg.password)
-                s.send_message(msg, to_addrs=rcpts)
+                _login(s, cfg)
+                yield s
         else:
             with smtplib.SMTP(cfg.host, cfg.port, timeout=30) as s:
                 s.ehlo()
@@ -72,14 +38,26 @@ def send(
                     s.starttls()
                     s.ehlo()
                 if cfg.username:
-                    s.login(cfg.username, cfg.password)
-                s.send_message(msg, to_addrs=rcpts)
+                    _login(s, cfg)
+                yield s
     except (smtplib.SMTPException, OSError) as e:
-        raise SmtpError(f"send failed: {e}") from e
+        # Redacted, cause dropped: a server may echo back the AUTH it rejected,
+        # which carries the credentials as base64.
+        auth_plain = base64.b64encode(f"\0{cfg.username}\0{cfg.password}".encode()).decode()
+        detail = redact(str(e), cfg.password, auth_plain)
+        raise SmtpError(f"{doing} failed: {detail}") from None
 
-    return {
-        "from": str(msg["From"]),
-        "to": str(msg["To"]),
-        "subject": subject,
-        "message_id": msg.get("Message-ID", ""),
-    }
+
+def send_message(cfg: SmtpConfig, msg: Message, to_addrs: list[str]) -> None:
+    """Send a message we built. smtplib drops the Bcc header on the way out."""
+    with _session(cfg) as s:
+        s.send_message(msg, to_addrs=to_addrs)
+
+
+def send_raw(cfg: SmtpConfig, raw: bytes, from_addr: str, to_addrs: list[str]) -> None:
+    """Send already-serialized bytes untouched (the caller strips Bcc first)."""
+    opts: list[str] = []
+    if not "".join([from_addr, *to_addrs]).isascii():
+        opts = ["SMTPUTF8", "BODY=8BITMIME"]
+    with _session(cfg) as s:
+        s.sendmail(from_addr, to_addrs, raw, mail_options=opts)

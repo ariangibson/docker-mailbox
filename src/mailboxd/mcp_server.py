@@ -20,18 +20,16 @@ import mcp.types as types
 from mcp.server import NotificationOptions, Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
-from . import __version__
+from . import __version__, ops
 from .config import Config, MailboxConfig
 from .imap_client import ImapError
 from .imap_client import delete_message as imap_delete
-from .imap_client import fetch_message as imap_fetch
 from .imap_client import list_folders as imap_list_folders
 from .imap_client import list_messages as imap_list_messages
 from .imap_client import mark_seen as imap_mark_seen
 from .imap_client import search_messages as imap_search_messages
 from .imap_client import unified_search as imap_unified_search
 from .smtp_client import SmtpError
-from .smtp_client import send as smtp_send
 
 _MAILBOX_ARG: dict[str, Any] = {
     "type": "string",
@@ -59,6 +57,42 @@ _SEARCH_PROPS: dict[str, Any] = {
     "larger_than": {"type": "integer", "minimum": 0},
     "smaller_than": {"type": "integer", "minimum": 0},
 }
+
+
+_THREAD_PROPS: dict[str, Any] = {
+    "in_reply_to": {
+        "type": "string",
+        "description": "Message-ID of the message this one answers, e.g. `<id@host>`.",
+    },
+    "references": {
+        "type": "string",
+        "description": (
+            "Space-separated Message-IDs of the thread so far, oldest first "
+            "(the parent's `references` followed by its `message_id`)."
+        ),
+    },
+}
+
+_DRAFT_PROPS: dict[str, Any] = {
+    "to": {"type": "array", "items": {"type": "string"}},
+    "subject": {"type": "string"},
+    "body_text": {"type": "string"},
+    "body_html": {"type": "string"},
+    "cc": {"type": "array", "items": {"type": "string"}},
+    "bcc": {"type": "array", "items": {"type": "string"}},
+    "from_address": {"type": "string"},
+    "reply_to": {"type": "string"},
+    **_THREAD_PROPS,
+}
+
+_DRAFT_UID: dict[str, Any] = {
+    "type": "string",
+    "description": "UID of the draft, as returned by `save_draft` / `list_drafts`.",
+}
+
+
+def _draft_kwargs(args: dict[str, Any]) -> dict[str, Any]:
+    return {key: args.get(key) for key in _DRAFT_PROPS}
 
 
 def _search_kwargs(args: dict[str, Any]) -> dict[str, Any]:
@@ -159,6 +193,11 @@ def _build_tools(
     # ── SMTP ops (only if at least one mailbox has SMTP) ─────────────────
     if any(mb.smtp is not None for mb in cfg.mailboxes):
         _register_smtp_tools(cfg, tools, handlers)
+
+    # ── Reply + drafts (stored over IMAP; sending them needs SMTP too) ───
+    if any(mb.imap is not None for mb in cfg.mailboxes):
+        _register_reply_tool(cfg, tools, handlers)
+        _register_draft_tools(cfg, tools, handlers)
 
     return tools, handlers
 
@@ -305,7 +344,13 @@ def _register_imap_tools(
                 "Pass `reader=true` to also include `body_reader` — a clean, "
                 "readable text/markdown version of the HTML body with chrome "
                 "stripped (no tables, styles, tracking pixels, just the words). "
-                "Best for LLMs that don't want to read raw HTML."
+                "Best for LLMs that don't want to read raw HTML. Also returns the "
+                "threading headers (`message_id`, `in_reply_to`, `references`), "
+                "the delivery headers (`delivered_to`, `x_original_to`, "
+                "`envelope_to`) and `received_for`: which of the mailbox's own "
+                "addresses the message was sent to (null if none matched). On a "
+                "catch-all mailbox that is the address to answer from. It is "
+                "read from the message's headers, so it is a hint, not proof."
             ),
             inputSchema={
                 "type": "object",
@@ -327,8 +372,9 @@ def _register_imap_tools(
 
     def _get_message(args: dict[str, Any], _c: Config = cfg) -> dict[str, Any]:
         mb = _resolve_mailbox(_c, str(args["mailbox"]))
-        return imap_fetch(
-            _require_imap(mb),
+        _require_imap(mb)
+        return ops.get_message(
+            mb,
             str(args["uid"]),
             folder=args.get("folder"),
             reader=bool(args.get("reader", False)),
@@ -399,7 +445,11 @@ def _register_smtp_tools(
     tools.append(
         types.Tool(
             name="send",
-            description="Send an email from a mailbox via SMTP.",
+            description=(
+                "Send an email from a mailbox via SMTP. A copy is saved to the "
+                "mailbox's Sent folder. To answer a message, prefer `reply`, "
+                "which fills in recipient, subject and threading for you."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -412,6 +462,7 @@ def _register_smtp_tools(
                     "bcc": {"type": "array", "items": {"type": "string"}},
                     "from_address": {"type": "string"},
                     "reply_to": {"type": "string"},
+                    **_THREAD_PROPS,
                 },
                 "required": ["mailbox", "to", "subject"],
                 "additionalProperties": False,
@@ -421,8 +472,9 @@ def _register_smtp_tools(
 
     def _send(args: dict[str, Any], _c: Config = cfg) -> dict[str, Any]:
         mb = _resolve_mailbox(_c, str(args["mailbox"]))
-        return smtp_send(
-            _require_smtp(mb),
+        _require_smtp(mb)
+        return ops.send(
+            mb,
             to=list(args["to"]),
             subject=str(args["subject"]),
             body_text=args.get("body_text"),
@@ -431,9 +483,223 @@ def _register_smtp_tools(
             bcc=list(args.get("bcc") or []),
             from_address=args.get("from_address"),
             reply_to=args.get("reply_to"),
+            in_reply_to=args.get("in_reply_to"),
+            references=args.get("references"),
         )
 
     handlers["send"] = _send
+
+
+def _register_reply_tool(
+    cfg: Config,
+    tools: list[types.Tool],
+    handlers: dict[str, Callable[[dict[str, Any]], Any]],
+) -> None:
+    tools.append(
+        types.Tool(
+            name="reply",
+            description=(
+                "Reply to a message. Recipient (the original's Reply-To, else "
+                "its From), subject (`Re: ...`) and threading headers are taken "
+                "from the original — supply only the body. `from_address` "
+                "defaults to the original's `received_for`, so a catch-all "
+                "mailbox answers from the address the mail was sent to. Pass "
+                "`draft=true` to save the reply to Drafts instead of sending it."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "mailbox": _MAILBOX_ARG,
+                    "uid": {"type": "string", "description": "UID of the message to answer."},
+                    "folder": {
+                        "type": "string",
+                        "description": "Folder that message is in (default INBOX).",
+                    },
+                    "body_text": {"type": "string"},
+                    "body_html": {"type": "string"},
+                    "from_address": {"type": "string"},
+                    "draft": {"type": "boolean", "default": False},
+                },
+                "required": ["mailbox", "uid"],
+                "additionalProperties": False,
+            },
+        )
+    )
+
+    def _reply(args: dict[str, Any], _c: Config = cfg) -> dict[str, Any]:
+        mb = _resolve_mailbox(_c, str(args["mailbox"]))
+        _require_imap(mb)
+        draft = bool(args.get("draft", False))
+        if not draft:
+            _require_smtp(mb)
+        return ops.reply(
+            mb,
+            str(args["uid"]),
+            folder=args.get("folder"),
+            body_text=args.get("body_text"),
+            body_html=args.get("body_html"),
+            from_address=args.get("from_address"),
+            draft=draft,
+        )
+
+    handlers["reply"] = _reply
+
+
+def _register_draft_tools(
+    cfg: Config,
+    tools: list[types.Tool],
+    handlers: dict[str, Callable[[dict[str, Any]], Any]],
+) -> None:
+    tools.append(
+        types.Tool(
+            name="save_draft",
+            description=(
+                "Save a new message to the mailbox's Drafts folder without "
+                "sending it. Every field but `mailbox` is optional. Returns the "
+                "draft's `uid`."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {"mailbox": _MAILBOX_ARG, **_DRAFT_PROPS},
+                "required": ["mailbox"],
+                "additionalProperties": False,
+            },
+        )
+    )
+
+    def _save_draft(args: dict[str, Any], _c: Config = cfg) -> dict[str, Any]:
+        mb = _resolve_mailbox(_c, str(args["mailbox"]))
+        _require_imap(mb)
+        return ops.save_draft(mb, **_draft_kwargs(args))
+
+    handlers["save_draft"] = _save_draft
+
+    tools.append(
+        types.Tool(
+            name="list_drafts",
+            description="List the mailbox's drafts, newest first.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "mailbox": _MAILBOX_ARG,
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
+                },
+                "required": ["mailbox"],
+                "additionalProperties": False,
+            },
+        )
+    )
+
+    def _list_drafts(args: dict[str, Any], _c: Config = cfg) -> dict[str, Any]:
+        mb = _resolve_mailbox(_c, str(args["mailbox"]))
+        _require_imap(mb)
+        return ops.list_drafts(mb, limit=int(args.get("limit", 50)))
+
+    handlers["list_drafts"] = _list_drafts
+
+    tools.append(
+        types.Tool(
+            name="get_draft",
+            description="Fetch a full draft (headers, incl. `bcc`, and body) by UID.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "mailbox": _MAILBOX_ARG,
+                    "uid": _DRAFT_UID,
+                    "reader": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Include `body_reader` (HTML stripped to readable text).",
+                    },
+                },
+                "required": ["mailbox", "uid"],
+                "additionalProperties": False,
+            },
+        )
+    )
+
+    def _get_draft(args: dict[str, Any], _c: Config = cfg) -> dict[str, Any]:
+        mb = _resolve_mailbox(_c, str(args["mailbox"]))
+        _require_imap(mb)
+        return ops.get_draft(mb, str(args["uid"]), reader=bool(args.get("reader", False)))
+
+    handlers["get_draft"] = _get_draft
+
+    tools.append(
+        types.Tool(
+            name="update_draft",
+            description=(
+                "Change a draft. Only the fields you pass are changed; the rest "
+                "(recipients, subject, threading) carry over. `body_text` and "
+                "`body_html` are replaced as a pair. Pass an empty list or empty "
+                "string to clear a field. The draft gets a NEW `uid` (returned) "
+                "— the old one stops existing. A draft with attachments cannot "
+                "be updated (it would lose them)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {"mailbox": _MAILBOX_ARG, "uid": _DRAFT_UID, **_DRAFT_PROPS},
+                "required": ["mailbox", "uid"],
+                "additionalProperties": False,
+            },
+        )
+    )
+
+    def _update_draft(args: dict[str, Any], _c: Config = cfg) -> dict[str, Any]:
+        mb = _resolve_mailbox(_c, str(args["mailbox"]))
+        _require_imap(mb)
+        return ops.update_draft(mb, str(args["uid"]), **_draft_kwargs(args))
+
+    handlers["update_draft"] = _update_draft
+
+    tools.append(
+        types.Tool(
+            name="delete_draft",
+            description="Permanently delete a draft (flag + expunge).",
+            inputSchema={
+                "type": "object",
+                "properties": {"mailbox": _MAILBOX_ARG, "uid": _DRAFT_UID},
+                "required": ["mailbox", "uid"],
+                "additionalProperties": False,
+            },
+        )
+    )
+
+    def _delete_draft(args: dict[str, Any], _c: Config = cfg) -> dict[str, Any]:
+        mb = _resolve_mailbox(_c, str(args["mailbox"]))
+        _require_imap(mb)
+        return ops.delete_draft(mb, str(args["uid"]))
+
+    handlers["delete_draft"] = _delete_draft
+
+    if not any(mb.imap is not None and mb.smtp is not None for mb in cfg.mailboxes):
+        return
+
+    tools.append(
+        types.Tool(
+            name="send_draft",
+            description=(
+                "Send a draft exactly as saved, file a copy in Sent, then "
+                "delete the draft. A result with `warnings` still means the "
+                "message was sent (only the Sent copy or the draft cleanup "
+                "failed) — do not send it again."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {"mailbox": _MAILBOX_ARG, "uid": _DRAFT_UID},
+                "required": ["mailbox", "uid"],
+                "additionalProperties": False,
+            },
+        )
+    )
+
+    def _send_draft(args: dict[str, Any], _c: Config = cfg) -> dict[str, Any]:
+        mb = _resolve_mailbox(_c, str(args["mailbox"]))
+        _require_imap(mb)
+        _require_smtp(mb)
+        return ops.send_draft(mb, str(args["uid"]))
+
+    handlers["send_draft"] = _send_draft
 
 
 def build_mcp_app(cfg: Config) -> Server:

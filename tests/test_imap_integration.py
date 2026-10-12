@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import imaplib
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 
 import imap_mock
 import pytest
@@ -39,21 +39,6 @@ from mailboxd.imap_client import (
 INJECT = 'INBOX"\r\nA9999 STORE 1:* +FLAGS (\\Deleted)\r\nA9998 EXPUNGE\r\nA9997 SELECT "INBOX'
 
 Factory = Callable[[dict[int, bytes]], "tuple[imap_mock.Sink, str, int]"]
-
-
-@pytest.fixture()
-def imap_factory() -> Any:
-    servers = []
-
-    def _make(messages: dict[int, bytes]) -> tuple[imap_mock.Sink, str, int]:
-        sink, srv, host, port = imap_mock.start(messages)
-        servers.append(srv)
-        return sink, host, port
-
-    yield _make
-    for srv in servers:
-        srv.shutdown()
-        srv.server_close()
 
 
 def _cfg(host: str, port: int) -> ImapConfig:

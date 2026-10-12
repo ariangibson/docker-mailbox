@@ -14,41 +14,49 @@ URL shape:
   GET    /mailboxes/{name}/messages/{uid}?folder=
   DELETE /mailboxes/{name}/messages/{uid}?folder=
   POST   /mailboxes/{name}/messages/{uid}/seen        body: {"seen": bool}
+  POST   /mailboxes/{name}/messages/{uid}/reply?folder=   body: {"body_text", "draft", ...}
   POST   /mailboxes/{name}/send                       (SMTP)
+  GET    /mailboxes/{name}/drafts?limit=              (IMAP)
+  POST   /mailboxes/{name}/drafts
+  GET    /mailboxes/{name}/drafts/{uid}?reader=
+  PUT    /mailboxes/{name}/drafts/{uid}
+  DELETE /mailboxes/{name}/drafts/{uid}
+  POST   /mailboxes/{name}/drafts/{uid}/send          (IMAP + SMTP)
 """
 
 from __future__ import annotations
 
 import contextlib
 import logging
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Iterator
 
 from fastapi import Body, FastAPI, HTTPException, Path, Query
 from pydantic import BaseModel
 from starlette.routing import Mount
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from . import __version__
+from . import __version__, ops
 from .config import Config, ConfigError, MailboxConfig, load_config
 from .imap_client import ImapError
 from .imap_client import delete_message as imap_delete
-from .imap_client import fetch_message as imap_fetch
 from .imap_client import list_folders as imap_list_folders
 from .imap_client import list_messages as imap_list_messages
 from .imap_client import mark_seen as imap_mark_seen
 from .imap_client import search_messages as imap_search_messages
 from .imap_client import unified_search as imap_unified_search
 from .mcp_server import build_session_manager, mcp_lifespan
+from .message import FromNotAllowedError, MessageError
 from .schemas import (
+    DraftRequest,
     FoldersResponse,
     GenericOK,
     HealthResponse,
     MailboxList,
     MailboxSummary,
+    ReplyRequest,
     SendRequest,
 )
 from .smtp_client import SmtpError
-from .smtp_client import send as smtp_send
 
 log = logging.getLogger("mailboxd")
 
@@ -74,6 +82,19 @@ def _need(mb: MailboxConfig, proto: str) -> None:
             status_code=409,
             detail=f"mailbox {mb.name!r} has no {proto} configured",
         )
+
+
+@contextlib.contextmanager
+def _mail_errors() -> Iterator[None]:
+    """Map mail-layer failures onto HTTP statuses."""
+    try:
+        yield
+    except FromNotAllowedError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except MessageError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    except (ImapError, SmtpError) as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
 
 
 _AUTH_EXEMPT_PATHS = frozenset({"/health"})
@@ -350,7 +371,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         mb = _resolve(cfg, name)
         _need(mb, "imap")
         try:
-            return imap_fetch(mb.imap, uid, folder=folder, reader=reader)  # type: ignore[arg-type]
+            return ops.get_message(mb, uid, folder=folder, reader=reader)
         except ImapError as e:
             raise HTTPException(status_code=502, detail=str(e)) from e
 
@@ -392,9 +413,9 @@ def create_app(config: Config | None = None) -> FastAPI:
     def send(name: str = Path(...), req: SendRequest = Body(...)) -> dict[str, Any]:
         mb = _resolve(cfg, name)
         _need(mb, "smtp")
-        try:
-            return smtp_send(
-                mb.smtp,  # type: ignore[arg-type]
+        with _mail_errors():
+            return ops.send(
+                mb,
                 to=[str(x) for x in req.to],
                 subject=req.subject,
                 body_text=req.body_text,
@@ -403,8 +424,88 @@ def create_app(config: Config | None = None) -> FastAPI:
                 bcc=[str(x) for x in (req.bcc or [])],
                 from_address=req.from_address,
                 reply_to=str(req.reply_to) if req.reply_to else None,
+                in_reply_to=req.in_reply_to,
+                references=req.references,
             )
-        except SmtpError as e:
-            raise HTTPException(status_code=502, detail=str(e)) from e
+
+    @app.post("/mailboxes/{name}/messages/{uid}/reply")
+    def reply(
+        name: str = Path(...),
+        uid: str = Path(...),
+        folder: str | None = Query(None),
+        req: ReplyRequest = Body(...),
+    ) -> dict[str, Any]:
+        mb = _resolve(cfg, name)
+        _need(mb, "imap")
+        if not req.draft:
+            _need(mb, "smtp")
+        with _mail_errors():
+            return ops.reply(
+                mb,
+                uid,
+                folder=folder,
+                body_text=req.body_text,
+                body_html=req.body_html,
+                from_address=req.from_address,
+                draft=req.draft,
+            )
+
+    # ── Drafts ──────────────────────────────────────────────────────────────
+
+    @app.get("/mailboxes/{name}/drafts")
+    def list_drafts(
+        name: str = Path(...),
+        limit: int = Query(50, ge=1, le=500),
+    ) -> dict[str, Any]:
+        mb = _resolve(cfg, name)
+        _need(mb, "imap")
+        with _mail_errors():
+            return ops.list_drafts(mb, limit=limit)
+
+    @app.post("/mailboxes/{name}/drafts")
+    def save_draft(name: str = Path(...), req: DraftRequest = Body(...)) -> dict[str, Any]:
+        mb = _resolve(cfg, name)
+        _need(mb, "imap")
+        with _mail_errors():
+            return ops.save_draft(mb, **req.model_dump())
+
+    @app.get("/mailboxes/{name}/drafts/{uid}")
+    def get_draft(
+        name: str = Path(...),
+        uid: str = Path(...),
+        reader: bool = Query(
+            False, description="Add `body_reader`: readable text/markdown from HTML"
+        ),
+    ) -> dict[str, Any]:
+        mb = _resolve(cfg, name)
+        _need(mb, "imap")
+        with _mail_errors():
+            return ops.get_draft(mb, uid, reader=reader)
+
+    @app.put("/mailboxes/{name}/drafts/{uid}")
+    def update_draft(
+        name: str = Path(...),
+        uid: str = Path(...),
+        req: DraftRequest = Body(...),
+    ) -> dict[str, Any]:
+        mb = _resolve(cfg, name)
+        _need(mb, "imap")
+        with _mail_errors():
+            return ops.update_draft(mb, uid, **req.model_dump())
+
+    @app.delete("/mailboxes/{name}/drafts/{uid}")
+    def delete_draft(name: str = Path(...), uid: str = Path(...)) -> dict[str, Any]:
+        mb = _resolve(cfg, name)
+        _need(mb, "imap")
+        with _mail_errors():
+            return ops.delete_draft(mb, uid)
+
+    @app.post("/mailboxes/{name}/drafts/{uid}/send")
+    def send_draft(name: str = Path(...), uid: str = Path(...)) -> dict[str, Any]:
+        mb = _resolve(cfg, name)
+        _need(mb, "imap")
+        _need(mb, "smtp")
+        with _mail_errors():
+            return ops.send_draft(mb, uid)
 
     return app

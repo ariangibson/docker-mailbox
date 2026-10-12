@@ -1,4 +1,4 @@
-"""IMAP operations: list folders, list/fetch/delete messages.
+"""IMAP operations: list folders, list/fetch/delete messages, drafts, Sent copies.
 
 Connections are short-lived — opened per request and closed in a finally
 block. Long-lived pooling would be nice but isn't worth the lifecycle
@@ -8,19 +8,22 @@ everywhere so subsequent operations stay stable across mailbox mutations.
 
 from __future__ import annotations
 
+import base64
 import email
 import imaplib
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from email.header import decode_header, make_header
 from email.message import Message
 from email.utils import parsedate_to_datetime
 from typing import Any, Iterator
 
 import html2text
 
-from .config import ImapConfig, MailboxConfig
+from .config import ImapConfig, MailboxConfig, redact
+from .message import decode_header_value as _decode
+from .message import received_for
 
 
 def _html_to_reader(html: str) -> str:
@@ -58,6 +61,17 @@ _FORBIDDEN_CHARS = ("\r", "\n", "\x00")
 # `,` `:` `*`. Anything else cannot be a valid UID and is refused outright,
 # which also makes UID values injection-proof by construction.
 _UID_RE = re.compile(r"^[0-9][0-9,:*]*$")
+# Draft and reply operations act on exactly one message, so a sequence-set
+# like `1:*` (which `_UID_RE` allows) must not get through to a STORE.
+_SINGLE_UID_RE = re.compile(r"^[0-9]+$")
+
+_TIMEOUT = 30
+
+# RFC 6154 SPECIAL-USE attributes, and the folder name to assume when the
+# server advertises none and the config doesn't name one either.
+_SPECIAL_USE = {"drafts": ("\\drafts", "Drafts"), "sent": ("\\sent", "Sent")}
+_LIST_RE = re.compile(r'^\((?P<flags>[^)]*)\)\s+(?:"(?:[^"\\]|\\.)*"|NIL)\s+(?P<name>.*)$')
+_APPENDUID_RE = re.compile(rb"\[APPENDUID\s+\d+\s+(\d+)\]", re.IGNORECASE)
 
 
 def _reject_control_chars(value: str, field: str) -> None:
@@ -70,20 +84,41 @@ def _validate_uid(uid: str) -> None:
         raise ImapError(f"invalid uid: {uid!r}")
 
 
+def _validate_single_uid(uid: str) -> None:
+    if not _SINGLE_UID_RE.match(uid):
+        raise ImapError(f"invalid uid: {uid!r} (expected a single numeric UID)")
+
+
 @contextmanager
 def _connect(cfg: ImapConfig) -> Iterator[imaplib.IMAP4]:
-    if cfg.tls == "ssl":
-        conn: imaplib.IMAP4 = imaplib.IMAP4_SSL(cfg.host, cfg.port)
-    else:
-        conn = imaplib.IMAP4(cfg.host, cfg.port)
-        if cfg.tls == "starttls":
-            conn.starttls()
+    # Whatever goes wrong in here leaves as an ImapError, so callers have one
+    # thing to catch. Server text is redacted and the cause dropped: a server
+    # may echo the LOGIN command it rejected, password included.
     try:
-        conn.login(cfg.username, cfg.password)
-    except imaplib.IMAP4.error as e:
-        raise ImapError(f"login failed: {e}") from e
+        if cfg.tls == "ssl":
+            conn: imaplib.IMAP4 = imaplib.IMAP4_SSL(cfg.host, cfg.port, timeout=_TIMEOUT)
+        else:
+            conn = imaplib.IMAP4(cfg.host, cfg.port, timeout=_TIMEOUT)
+            if cfg.tls == "starttls":
+                conn.starttls()
+    except (imaplib.IMAP4.error, OSError) as e:
+        raise ImapError(f"connection failed: {redact(str(e), cfg.password)}") from None
     try:
-        yield conn
+        try:
+            conn.login(cfg.username, cfg.password)
+        except (imaplib.IMAP4.error, OSError) as e:
+            raise ImapError(f"login failed: {redact(str(e), cfg.password)}") from None
+        except UnicodeError:
+            raise ImapError(
+                "login failed: the username or password has non-ASCII characters, "
+                "which IMAP LOGIN cannot carry"
+            ) from None
+        try:
+            yield conn
+        except (imaplib.IMAP4.error, OSError) as e:
+            # A `BAD` reply or a dropped connection raises out of imaplib
+            # instead of coming back as a status.
+            raise ImapError(redact(str(e), cfg.password)) from None
     finally:
         try:
             conn.logout()
@@ -91,28 +126,99 @@ def _connect(cfg: ImapConfig) -> Iterator[imaplib.IMAP4]:
             pass
 
 
-def _decode(s: Any) -> str:
-    if s is None:
-        return ""
-    if isinstance(s, bytes):
-        try:
-            s = s.decode("utf-8")
-        except UnicodeDecodeError:
-            s = s.decode("latin-1", errors="replace")
-    try:
-        return str(make_header(decode_header(str(s))))
-    except Exception:
-        return str(s)
+def _mutf7(name: str) -> str:
+    """A mailbox name in IMAP's modified UTF-7 (RFC 3501 §5.1.3)."""
+    out: list[str] = []
+    run: list[str] = []
+
+    def _flush() -> None:
+        if run:
+            b64 = base64.b64encode("".join(run).encode("utf-16-be")).decode("ascii")
+            out.append("&" + b64.rstrip("=").replace("/", ",") + "-")
+            run.clear()
+
+    for ch in name:
+        if " " <= ch <= "~":
+            _flush()
+            out.append("&-" if ch == "&" else ch)
+        else:
+            run.append(ch)
+    _flush()
+    return "".join(out)
 
 
-def _select(conn: imaplib.IMAP4, folder: str, readonly: bool = False) -> None:
+def _quote(folder: str) -> str:
     _reject_control_chars(folder, "folder")
+    # A name the server gave us is already ASCII (modified UTF-7) and goes back
+    # untouched; one typed by a person ("Envoyés") has to be encoded.
+    if not folder.isascii():
+        folder = _mutf7(folder)
     # Send the name as a properly-escaped IMAP quoted string so an embedded
     # `"` or `\` cannot break out of the quoting either.
     escaped = folder.replace("\\", "\\\\").replace('"', '\\"')
-    typ, _ = conn.select(f'"{escaped}"', readonly=readonly)
+    return f'"{escaped}"'
+
+
+def _select(conn: imaplib.IMAP4, folder: str, readonly: bool = False) -> None:
+    typ, _ = conn.select(_quote(folder), readonly=readonly)
     if typ != "OK":
         raise ImapError(f"could not select folder {folder!r}")
+
+
+def _capabilities(conn: imaplib.IMAP4) -> set[str]:
+    """Capabilities as advertised *after* login.
+
+    imaplib only records the pre-auth set, which on most servers leaves out
+    the ones that matter here (UIDPLUS, SPECIAL-USE, LIST-EXTENDED).
+    """
+    typ, data = conn.capability()
+    if typ == "OK" and data and data[-1]:
+        return set(data[-1].decode("ascii", errors="replace").upper().split())
+    return {str(c).upper() for c in conn.capabilities}
+
+
+def _parse_list(data: list[Any]) -> list[tuple[set[str], str]]:
+    """LIST response lines as (lower-cased attributes, mailbox name) pairs."""
+    out: list[tuple[set[str], str]] = []
+    for raw in data or []:
+        if not raw:
+            continue
+        literal: bytes | None = None
+        if isinstance(raw, tuple):
+            # Name sent as an IMAP literal: (b'(\\Drafts) "/" {6}', b'Drafts')
+            raw, literal = raw[0], raw[1]
+        line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+        m = _LIST_RE.match(line)
+        if m is None:
+            continue
+        name = m.group("name").strip()
+        if literal is not None:
+            name = literal.decode("utf-8", errors="replace")
+        elif len(name) >= 2 and name[0] == name[-1] == '"':
+            name = re.sub(r"\\(.)", r"\1", name[1:-1])
+        if name:
+            out.append(({f.lower() for f in m.group("flags").split()}, name))
+    return out
+
+
+def _special_folder(conn: imaplib.IMAP4, kind: str, configured: str | None) -> str:
+    """Resolve the Drafts / Sent folder: SPECIAL-USE, then config, then the default."""
+    attr, default = _SPECIAL_USE[kind]
+
+    def _flagged(data: list[Any]) -> str | None:
+        return next((name for flags, name in _parse_list(data) if attr in flags), None)
+
+    typ, data = conn.list()
+    if typ != "OK":
+        raise ImapError("LIST failed")
+    found = _flagged(data)
+    if found is None and {"SPECIAL-USE", "LIST-EXTENDED"} <= _capabilities(conn):
+        # RFC 6154 lets a server leave the attributes out of a plain LIST and
+        # only return them when asked for explicitly.
+        typ, data = conn.list('""', '"*" RETURN (SPECIAL-USE)')
+        if typ == "OK":
+            found = _flagged(data)
+    return found or configured or default
 
 
 def list_folders(cfg: ImapConfig) -> list[str]:
@@ -326,29 +432,67 @@ def _extract_flags(meta: str) -> list[str]:
     return meta[j + 1 : k].split()
 
 
+def _fetch_raw(conn: imaplib.IMAP4, uid: str) -> bytes:
+    typ, data = conn.uid("FETCH", uid, "(RFC822)")
+    if typ != "OK" or not data or not isinstance(data[0], tuple):
+        raise ImapError(f"could not fetch UID {uid}")
+    raw = data[0][1]
+    return raw if isinstance(raw, bytes) else raw.encode()
+
+
+def fetch_raw(cfg: ImapConfig, uid: str, folder: str | None = None) -> bytes:
+    """The raw RFC 822 bytes of one message."""
+    folder = folder or cfg.default_folder
+    _validate_single_uid(uid)
+    _reject_control_chars(folder, "folder")
+    with _connect(cfg) as conn:
+        _select(conn, folder, readonly=True)
+        return _fetch_raw(conn, uid)
+
+
 def fetch_message(
     cfg: ImapConfig,
     uid: str,
     folder: str | None = None,
     reader: bool = False,
+    identity: tuple[str | None, str | None] = (None, None),
 ) -> dict[str, Any]:
+    """Fetch and decode one message.
+
+    `identity` is the mailbox's (login address, domain); it is what
+    `received_for` is computed against.
+    """
     folder = folder or cfg.default_folder
     _validate_uid(uid)
     _reject_control_chars(folder, "folder")
     with _connect(cfg) as conn:
         _select(conn, folder, readonly=True)
-        typ, data = conn.uid("FETCH", uid, "(RFC822)")
-        if typ != "OK" or not data or not isinstance(data[0], tuple):
-            raise ImapError(f"could not fetch UID {uid}")
-        raw = data[0][1]
-        msg = email.message_from_bytes(raw if isinstance(raw, bytes) else raw.encode())
-        return _serialize_message(msg, uid=uid, reader=reader)
+        return decode_message(_fetch_raw(conn, uid), uid=uid, reader=reader, identity=identity)
+
+
+def decode_message(
+    raw: bytes,
+    uid: str | None = None,
+    reader: bool = False,
+    identity: tuple[str | None, str | None] = (None, None),
+) -> dict[str, Any]:
+    """Raw RFC 822 bytes as the dict `fetch_message` returns."""
+    msg = email.message_from_bytes(raw)
+    return _serialize_message(msg, uid=uid, reader=reader, identity=identity)
+
+
+def _header(msg: Message, name: str) -> str:
+    # Unfolded, and every instance kept: Delivered-To and friends are added
+    # once per hop.
+    values = (" ".join(_decode(raw).split()) for raw in msg.get_all(name, []))
+    return ", ".join(v for v in values if v)
 
 
 def _serialize_message(
     msg: Message,
     uid: str | None = None,
     reader: bool = False,
+    identity: tuple[str | None, str | None] = (None, None),
 ) -> dict[str, Any]:
     body_text: str | None = None
     body_html: str | None = None
@@ -391,9 +535,17 @@ def _serialize_message(
         "from": _decode(msg.get("From")),
         "to": _decode(msg.get("To")),
         "cc": _decode(msg.get("Cc")),
+        "bcc": _decode(msg.get("Bcc")),
+        "reply_to": _decode(msg.get("Reply-To")),
         "subject": _decode(msg.get("Subject")),
         "date": _decode(msg.get("Date")),
         "message_id": _decode(msg.get("Message-ID")),
+        "in_reply_to": _header(msg, "In-Reply-To"),
+        "references": " ".join(_header(msg, "References").replace(",", " ").split()),
+        "delivered_to": _header(msg, "Delivered-To"),
+        "x_original_to": _header(msg, "X-Original-To"),
+        "envelope_to": _header(msg, "Envelope-To"),
+        "received_for": received_for(msg, domain=identity[1], login_address=identity[0]),
         "body_text": body_text,
         "body_html": body_html,
         "body_reader": body_reader,
@@ -422,6 +574,134 @@ def delete_message(cfg: ImapConfig, uid: str, folder: str | None = None) -> None
         if typ != "OK":
             raise ImapError(f"STORE \\Deleted failed for UID {uid}")
         conn.expunge()
+
+
+# ── Drafts / Sent ───────────────────────────────────────────────────────────
+
+
+def _append(
+    conn: imaplib.IMAP4,
+    folder: str,
+    raw: bytes,
+    flags: str,
+    hint: str,
+    message_id: str | None = None,
+) -> str | None:
+    """APPEND `raw` to `folder` and return its new UID if it can be learned.
+
+    The UID comes from the UIDPLUS `APPENDUID` response code; a server without
+    UIDPLUS is asked for it by Message-ID instead. `hint` names the config key
+    to set when the folder turns out not to exist.
+    """
+    internal_date = imaplib.Time2Internaldate(time.time())
+    # typeshed declares a `str` return; like every imaplib command it is (typ, [data]).
+    resp: Any = conn.append(_quote(folder), flags, internal_date, raw)
+    typ, data = resp
+    if typ != "OK":
+        detail = data[-1].decode("utf-8", errors="replace") if data and data[-1] else ""
+        raise ImapError(
+            f"could not append to folder {folder!r}: {detail or typ} "
+            f"(if the folder has another name on this server, set `{hint}`)"
+        )
+    m = _APPENDUID_RE.search(data[-1] or b"") if data else None
+    if m is not None:
+        return m.group(1).decode("ascii")
+    if not message_id:
+        return None
+    _reject_control_chars(message_id, "message id")
+    quoted = message_id.replace("\\", "\\\\").replace('"', '\\"')
+    _select(conn, folder, readonly=True)
+    typ, found = conn.uid("SEARCH", "HEADER", "Message-ID", f'"{quoted}"')
+    uids = (found[0] or b"").split() if typ == "OK" and found else []
+    return max(uids, key=int).decode("ascii") if uids else None
+
+
+def _delete_uid(conn: imaplib.IMAP4, uid: str) -> None:
+    """Flag one UID \\Deleted and expunge it (the folder must be selected read-write)."""
+    typ, _ = conn.uid("STORE", uid, "+FLAGS", r"(\Deleted)")
+    if typ != "OK":
+        raise ImapError(f"STORE \\Deleted failed for UID {uid}")
+    if "UIDPLUS" in _capabilities(conn):
+        # UID EXPUNGE removes only this message; a bare EXPUNGE would also purge
+        # anything another client had flagged \Deleted but not yet expunged.
+        typ, _ = conn.uid("EXPUNGE", uid)
+    else:
+        typ, _ = conn.expunge()
+    if typ != "OK":
+        raise ImapError(f"EXPUNGE failed for UID {uid}")
+
+
+def _require_uid(conn: imaplib.IMAP4, uid: str, folder: str) -> None:
+    typ, data = conn.uid("FETCH", uid, "(FLAGS)")
+    if typ != "OK" or not data or data[0] is None:
+        raise ImapError(f"no message with UID {uid} in folder {folder!r}")
+
+
+def save_draft(cfg: ImapConfig, raw: bytes, message_id: str | None = None) -> dict[str, Any]:
+    """APPEND a message to the Drafts folder, flagged \\Draft.
+
+    Returns `{"folder", "uid"}`; `uid` is None only when the server gives no
+    way to learn it.
+    """
+    with _connect(cfg) as conn:
+        folder = _special_folder(conn, "drafts", cfg.drafts_folder)
+        uid = _append(conn, folder, raw, r"(\Draft \Seen)", "imap.drafts_folder", message_id)
+        return {"folder": folder, "uid": uid}
+
+
+def replace_draft(
+    cfg: ImapConfig, uid: str, raw: bytes, message_id: str | None = None
+) -> dict[str, Any]:
+    """Swap a draft for a new version: append first, then delete + expunge the old UID.
+
+    IMAP has no in-place edit. Appending before deleting means a failure
+    half-way leaves both versions rather than neither.
+    """
+    _validate_single_uid(uid)
+    with _connect(cfg) as conn:
+        folder = _special_folder(conn, "drafts", cfg.drafts_folder)
+        _select(conn, folder, readonly=False)
+        _require_uid(conn, uid, folder)
+        new_uid = _append(conn, folder, raw, r"(\Draft \Seen)", "imap.drafts_folder", message_id)
+        _select(conn, folder, readonly=False)
+        _delete_uid(conn, uid)
+        return {"folder": folder, "uid": new_uid}
+
+
+def list_drafts(cfg: ImapConfig, limit: int = 50) -> dict[str, Any]:
+    with _connect(cfg) as conn:
+        folder = _special_folder(conn, "drafts", cfg.drafts_folder)
+        _select(conn, folder, readonly=True)
+        uids = _uid_search(conn, "ALL")
+        return {"folder": folder, "messages": _fetch_headers(conn, uids, limit)}
+
+
+def fetch_draft_raw(cfg: ImapConfig, uid: str) -> tuple[str, bytes]:
+    """(Drafts folder name, raw RFC 822 bytes) for one draft."""
+    _validate_single_uid(uid)
+    with _connect(cfg) as conn:
+        folder = _special_folder(conn, "drafts", cfg.drafts_folder)
+        _select(conn, folder, readonly=True)
+        return folder, _fetch_raw(conn, uid)
+
+
+def delete_draft(cfg: ImapConfig, uid: str) -> str:
+    """Delete + expunge one draft. Returns the Drafts folder name."""
+    _validate_single_uid(uid)
+    with _connect(cfg) as conn:
+        folder = _special_folder(conn, "drafts", cfg.drafts_folder)
+        _select(conn, folder, readonly=False)
+        _require_uid(conn, uid, folder)
+        _delete_uid(conn, uid)
+        return folder
+
+
+def save_sent(cfg: ImapConfig, raw: bytes) -> str:
+    """APPEND a copy of a sent message to the Sent folder. Returns the folder name."""
+    with _connect(cfg) as conn:
+        folder = _special_folder(conn, "sent", cfg.sent_folder)
+        _append(conn, folder, raw, r"(\Seen)", "imap.sent_folder")
+        return folder
 
 
 def unified_search(
