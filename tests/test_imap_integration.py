@@ -103,7 +103,11 @@ def test_uid_crlf_injection_is_rejected(imap_factory: Factory) -> None:
         fetch_message(_cfg(host, port), uid="1\r\nZ99 UID STORE 1 +FLAGS (\\Deleted)")
     with pytest.raises(ImapError):
         delete_message(_cfg(host, port), uid="1\r\nZ99 EXPUNGE")
+    # A lone trailing newline used to slip past `$` in the UID pattern.
+    with pytest.raises(ImapError):
+        fetch_message(_cfg(host, port), uid="1\n")
     assert _no_destructive(sink.commands)
+    assert sink.commands == []
 
 
 def test_search_crlf_injection_is_rejected(imap_factory: Factory) -> None:

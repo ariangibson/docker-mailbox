@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import os
 import re
+import ssl
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
@@ -38,6 +39,9 @@ class ImapConfig(BaseModel):
     host: str
     port: int = 993
     tls: TlsMode = "ssl"
+    # Check the server's certificate and hostname. Only turn off for a server
+    # with a self-signed certificate that you reach over a network you trust.
+    tls_verify: bool = True
     username: str
     password: str
     default_folder: str = "INBOX"
@@ -54,6 +58,7 @@ class SmtpConfig(BaseModel):
     host: str
     port: int = 587
     tls: TlsMode = "starttls"
+    tls_verify: bool = True
     username: str
     password: str
     from_address: str
@@ -131,6 +136,21 @@ class Config(BaseModel):
             if m.name == name:
                 return m
         return None
+
+
+def tls_context(verify: bool = True) -> ssl.SSLContext:
+    """The TLS context for an IMAP / SMTP connection.
+
+    This has to be passed explicitly: left to themselves, imaplib and smtplib
+    use a context that checks neither the certificate nor the hostname, so
+    anyone on the network path could impersonate the mail server and collect
+    the password.
+    """
+    ctx = ssl.create_default_context()
+    if not verify:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
 
 
 class ConfigError(Exception):

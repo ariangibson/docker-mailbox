@@ -209,6 +209,26 @@ def test_sent_copy_is_off_for_providers_that_keep_their_own(tmp_path: Path) -> N
     assert "MAILBOX_F_SAVE_SENT" in _error(tmp_path, {**env, "MAILBOX_F_SAVE_SENT": "sometimes"})
 
 
+def test_tls_verification_is_on_unless_switched_off(tmp_path: Path) -> None:
+    env = {
+        **BASE,
+        "MAILBOX_PROVIDER_LAN_IMAP_HOST": "mail.lan.test",
+        "MAILBOX_PROVIDER_LAN_IMAP_TLS_VERIFY": "false",
+        "MAILBOX_PROVIDER_LAN_SMTP_HOST": "mail.lan.test",
+        "MAILBOX_HOME": "lan:me@lan.test:pw",
+        "MAILBOX_HOME_SMTP_TLS_VERIFY": "no",
+        "MAILBOX_P": "purelymail:a@example.com:pw",
+    }
+    cfg = _load(tmp_path, env)
+    home, p = cfg.get("home"), cfg.get("p")
+    assert home and home.imap and home.smtp and p and p.imap and p.smtp
+    assert (home.imap.tls_verify, home.smtp.tls_verify) == (False, False)
+    assert (p.imap.tls_verify, p.smtp.tls_verify) == (True, True)
+    # `_IMAP_TLS_VERIFY` must not be read as `_IMAP_TLS`, nor as an account.
+    assert home.imap.tls == "ssl"
+    assert "TLS_VERIFY" in _error(tmp_path, {**env, "MAILBOX_HOME_IMAP_TLS_VERIFY": "maybe"})
+
+
 def test_account_names_are_lowercased_and_may_contain_underscores(tmp_path: Path) -> None:
     cfg = _load(tmp_path, {**BASE, "MAILBOX_Side_Project_2": "fastmail:a@example.com:pw"})
     assert [m.name for m in cfg.mailboxes] == ["side_project_2"]

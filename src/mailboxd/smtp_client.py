@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from email.message import Message
 from typing import Iterator
 
-from .config import SmtpConfig, redact
+from .config import SmtpConfig, redact, tls_context
 
 
 class SmtpError(Exception):
@@ -28,14 +28,15 @@ def _login(s: smtplib.SMTP, cfg: SmtpConfig) -> None:
 def _session(cfg: SmtpConfig, doing: str = "send") -> Iterator[smtplib.SMTP]:
     try:
         if cfg.tls == "ssl":
-            with smtplib.SMTP_SSL(cfg.host, cfg.port, timeout=30) as s:
+            ctx = tls_context(cfg.tls_verify)
+            with smtplib.SMTP_SSL(cfg.host, cfg.port, timeout=30, context=ctx) as s:
                 _login(s, cfg)
                 yield s
         else:
             with smtplib.SMTP(cfg.host, cfg.port, timeout=30) as s:
                 s.ehlo()
                 if cfg.tls == "starttls":
-                    s.starttls()
+                    s.starttls(context=tls_context(cfg.tls_verify))
                     s.ehlo()
                 if cfg.username:
                     _login(s, cfg)

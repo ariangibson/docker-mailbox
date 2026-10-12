@@ -41,7 +41,7 @@ def check_bearer(auth_cfg: AuthConfig, request: Request) -> None:
             headers={"WWW-Authenticate": "Bearer"},
         )
     for tok in auth_cfg.tokens:
-        if hmac.compare_digest(tok, presented):
+        if hmac.compare_digest(tok.encode(), presented.encode()):
             return
     raise HTTPException(
         status_code=401,

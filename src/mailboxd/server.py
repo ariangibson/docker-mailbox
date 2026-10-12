@@ -113,13 +113,14 @@ def _bearer_ok(cfg: Config, scope: Scope) -> bool:
 
     for k, v in scope.get("headers", []):
         if k == b"authorization":
-            auth = v.decode("latin-1")
-            if not auth.startswith("Bearer "):
+            if not v.startswith(b"Bearer "):
                 return False
-            presented = auth[7:].strip()
+            presented = v[7:].strip()
             if not presented:
                 return False
-            return any(hmac.compare_digest(t, presented) for t in cfg.auth.tokens)
+            # Bytes, not str: compare_digest raises on non-ASCII text, which
+            # turned a garbage header into a 500 instead of a 401.
+            return any(hmac.compare_digest(t.encode(), presented) for t in cfg.auth.tokens)
     return False
 
 

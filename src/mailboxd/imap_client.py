@@ -21,7 +21,7 @@ from typing import Any, Iterator
 
 import html2text
 
-from .config import ImapConfig, MailboxConfig, redact
+from .config import ImapConfig, MailboxConfig, redact, tls_context
 from .message import decode_header_value as _decode
 from .message import received_for
 
@@ -80,12 +80,13 @@ def _reject_control_chars(value: str, field: str) -> None:
 
 
 def _validate_uid(uid: str) -> None:
-    if not _UID_RE.match(uid):
+    # fullmatch, not match: `$` would let a trailing newline through.
+    if not _UID_RE.fullmatch(uid):
         raise ImapError(f"invalid uid: {uid!r}")
 
 
 def _validate_single_uid(uid: str) -> None:
-    if not _SINGLE_UID_RE.match(uid):
+    if not _SINGLE_UID_RE.fullmatch(uid):
         raise ImapError(f"invalid uid: {uid!r} (expected a single numeric UID)")
 
 
@@ -96,11 +97,13 @@ def _connect(cfg: ImapConfig) -> Iterator[imaplib.IMAP4]:
     # may echo the LOGIN command it rejected, password included.
     try:
         if cfg.tls == "ssl":
-            conn: imaplib.IMAP4 = imaplib.IMAP4_SSL(cfg.host, cfg.port, timeout=_TIMEOUT)
+            conn: imaplib.IMAP4 = imaplib.IMAP4_SSL(
+                cfg.host, cfg.port, ssl_context=tls_context(cfg.tls_verify), timeout=_TIMEOUT
+            )
         else:
             conn = imaplib.IMAP4(cfg.host, cfg.port, timeout=_TIMEOUT)
             if cfg.tls == "starttls":
-                conn.starttls()
+                conn.starttls(ssl_context=tls_context(cfg.tls_verify))
     except (imaplib.IMAP4.error, OSError) as e:
         raise ImapError(f"connection failed: {redact(str(e), cfg.password)}") from None
     try:
@@ -572,7 +575,9 @@ def _payload_str(part: Message) -> str:
 
 def delete_message(cfg: ImapConfig, uid: str, folder: str | None = None) -> None:
     folder = folder or cfg.default_folder
-    _validate_uid(uid)
+    # One message per call. A sequence-set here (`1:*`) would empty the folder,
+    # permanently, on the say-so of a single request.
+    _validate_single_uid(uid)
     _reject_control_chars(folder, "folder")
     with _connect(cfg) as conn:
         _select(conn, folder, readonly=False)

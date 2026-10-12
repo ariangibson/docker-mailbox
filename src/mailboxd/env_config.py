@@ -5,7 +5,7 @@ needed. Every `MAILBOX_*` variable is one of four things:
 
   global setting     MAILBOX_AUTH_TOKENS, MAILBOX_LOG_LEVEL, MAILBOX_PORT,
                      MAILBOX_ALLOW_NO_AUTH
-  provider preset    MAILBOX_PROVIDER_<NAME>_{IMAP,SMTP}_{HOST,PORT,TLS}
+  provider preset    MAILBOX_PROVIDER_<NAME>_{IMAP,SMTP}_{HOST,PORT,TLS,TLS_VERIFY}
   account override   MAILBOX_<NAME>_<SUFFIX>, for the suffixes in `_ACCOUNT_FIELDS`
   account            anything else: MAILBOX_<NAME>=<provider>:<username>:<password>
 
@@ -39,9 +39,11 @@ _PROVIDER_FIELDS: dict[str, tuple[str, ...]] = {
     "IMAP_HOST": ("imap", "host"),
     "IMAP_PORT": ("imap", "port"),
     "IMAP_TLS": ("imap", "tls"),
+    "IMAP_TLS_VERIFY": ("imap", "tls_verify"),
     "SMTP_HOST": ("smtp", "host"),
     "SMTP_PORT": ("smtp", "port"),
     "SMTP_TLS": ("smtp", "tls"),
+    "SMTP_TLS_VERIFY": ("smtp", "tls_verify"),
 }
 _ACCOUNT_FIELDS: dict[str, tuple[str, ...]] = {
     **_PROVIDER_FIELDS,
@@ -100,7 +102,7 @@ def _coerce(var: str, suffix: str, value: str) -> Any:
             # An empty list would mean "unrestricted", silently undoing the default.
             raise EnvError(f"{var}: must list at least one address pattern (`*` allows any)")
         return patterns
-    if suffix == "SAVE_SENT":
+    if suffix == "SAVE_SENT" or suffix.endswith("_TLS_VERIFY"):
         return _bool(var, value)
     return value
 
