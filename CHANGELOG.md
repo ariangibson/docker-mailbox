@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-Drafts, threaded replies, catch-all address handling, a sender allow-list, and
-configuration from environment variables.
+Drafts, threaded replies, catch-all address handling, a sender allow-list,
+moving messages between folders, and configuration from environment variables.
 
 **Behavior changes:**
 
@@ -75,6 +75,16 @@ configuration from environment variables.
   for amd64 and arm64 on pushes to `main`. The upstream project's workflows
   (Docker Hub, mirrors, registry publishing) are now skipped outside the
   upstream repository.
+- **Moving messages.** `move_message` / `POST /mailboxes/{name}/messages/move`
+  moves one or more UIDs to another folder, reporting `moved`, `not_found` or
+  `error` per UID. `to_folder` may be the role `junk`, `trash` or `archive`,
+  resolved via SPECIAL-USE (`\Junk`, `\Trash`, `\Archive`) and then common
+  folder names. Uses IMAP `MOVE` when advertised; otherwise COPY, flag
+  `\Deleted`, and `UID EXPUNGE` of just those UIDs. `mark_spam` /
+  `POST /mailboxes/{name}/messages/spam` moves to Junk.
+- **Reading no longer risks marking mail read.** Message bodies are fetched
+  with `BODY.PEEK[]` instead of `RFC822`, which sets `\Seen` on any folder
+  not opened read-only.
 - **`GET /health/detail`** (authenticated) logs in to every account's IMAP and
   SMTP server and reports which succeeded.
 - IMAP connections now time out after 30 seconds, and connection and protocol

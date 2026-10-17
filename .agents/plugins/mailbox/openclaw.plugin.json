@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "type": "code-plugin",
   "summary": "Wire an OpenClaw agent to a self-hosted docker-mailbox IMAP/SMTP control plane over MCP — read, search, send, mark-seen, and delete mail across multiple inboxes.",
-  "description": "A thin stdio<->HTTP bridge that connects an MCP client (OpenClaw, Claude, Cursor, Codex, ...) to a running docker-mailbox instance's MCP endpoint (/mcp), exposing its tools: mailboxes (discovery), inbox (unified cross-account read), list_folders, list_messages, search, get_message, delete_message, mark_seen, send, reply, and the drafts tools (save_draft, list_drafts, get_draft, update_draft, delete_draft, send_draft). docker-mailbox is a multi-mailbox IMAP/SMTP control plane exposed as a REST API + MCP server on a single port. It is self-hosted — you run the server yourself and point this bridge at it. See https://github.com/psyb0t/docker-mailbox.",
+  "description": "A thin stdio<->HTTP bridge that connects an MCP client (OpenClaw, Claude, Cursor, Codex, ...) to a running docker-mailbox instance's MCP endpoint (/mcp), exposing its tools: mailboxes (discovery), inbox (unified cross-account read), list_folders, list_messages, search, get_message, delete_message, mark_seen, move_message, mark_spam, send, reply, and the drafts tools (save_draft, list_drafts, get_draft, update_draft, delete_draft, send_draft). docker-mailbox is a multi-mailbox IMAP/SMTP control plane exposed as a REST API + MCP server on a single port. It is self-hosted — you run the server yourself and point this bridge at it. See https://github.com/psyb0t/docker-mailbox.",
   "extensions": ["./bin/cli.js"],
   "compat": {
     "pluginApi": ">=2026.3.24-beta.2"

@@ -1,6 +1,6 @@
 ---
 name: docker-mailbox
-description: Multi-mailbox IMAP/SMTP control plane exposed as a REST API + MCP server (streamable HTTP) on a single port. Read, search, send, mark-seen, and delete mail across multiple inboxes in one call — `GET /inbox` fans out across every IMAP account in parallel and returns a merged, newest-first feed. Use when you need an agent (or a script, or a curl one-liner) to drive one or more real mail accounts without standing up a webmail UI, a message store, or any per-provider client library. Stdlib `imaplib`/`smtplib` under the hood, FastAPI on top, bearer-token auth optional.
+description: Multi-mailbox IMAP/SMTP control plane exposed as a REST API + MCP server (streamable HTTP) on a single port. Read, search, send, mark-seen, move, and delete mail across multiple inboxes in one call — `GET /inbox` fans out across every IMAP account in parallel and returns a merged, newest-first feed. Use when you need an agent (or a script, or a curl one-liner) to drive one or more real mail accounts without standing up a webmail UI, a message store, or any per-provider client library. Stdlib `imaplib`/`smtplib` under the hood, FastAPI on top, bearer-token auth.
 compatibility: Requires curl and a running mailboxd instance. MAILBOX_URL env var must be set. MAILBOX_TOKEN is optional — only needed if the server was started with `auth.tokens` configured.
 metadata:
   author: psyb0t
@@ -184,10 +184,26 @@ curl -s -X POST -H "Authorization: Bearer $MAILBOX_TOKEN" \
   -d '{"seen": true}' \
   "$MAILBOX_URL/mailboxes/personal/messages/1234/seen?folder=INBOX"
 
+# Move — to a folder name, or to the role junk / trash / archive
+curl -s -X POST -H "Authorization: Bearer $MAILBOX_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"uids": ["1234", "1235"], "from_folder": "INBOX", "to_folder": "archive"}' \
+  "$MAILBOX_URL/mailboxes/personal/messages/move"
+
+# Mark as spam (= move to the Junk folder)
+curl -s -X POST -H "Authorization: Bearer $MAILBOX_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"uids": ["1234"]}' \
+  "$MAILBOX_URL/mailboxes/personal/messages/spam"
+
 # Delete (flag \Deleted + EXPUNGE — gone, really gone)
 curl -s -X DELETE -H "Authorization: Bearer $MAILBOX_TOKEN" \
   "$MAILBOX_URL/mailboxes/personal/messages/1234?folder=INBOX"
 ```
+
+Moves return the destination's real name (`to_folder`) and a result per UID — `moved`, `not_found`, or `error` with a reason — so check `results`, not just the status code. The roles resolve via SPECIAL-USE (`\Junk`, `\Trash`, `\Archive`), then folders named `Junk`/`Spam`, `Trash`, `Archive`; no match is an error. Prefer `trash` over `DELETE` when a message only needs to go away: it can be recovered.
+
+Fetching a message never marks it read (`BODY.PEEK[]`); only `/seen` changes `\Seen`.
 
 `DELETE /mailboxes/<name>/messages/<uid>` permanently removes one message (`\Deleted` + `EXPUNGE`, no undo); it takes a single UID, not a range. Confirm the target `mailbox`/UID first — see [Security & safety](#security--safety).
 
@@ -328,6 +344,8 @@ search                      # (mailbox, from, subject, since, ...)
 get_message                 # (mailbox, uid, reader=true → +body_reader) incl. received_for
 delete_message              # (mailbox, uid)
 mark_seen                   # (mailbox, uid, seen)
+move_message                # (mailbox, uids, to_folder, from_folder) — to_folder may be junk / trash / archive
+mark_spam                   # (mailbox, uids, from_folder) → the Junk folder
 send                        # (mailbox, to, subject, body_text/html, in_reply_to, references, ...)
 reply                       # (mailbox, uid, folder, body_text/html, from_address, draft)
 save_draft                  # (mailbox, to, subject, body_text/html, ...) → uid

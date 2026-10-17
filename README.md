@@ -20,6 +20,7 @@ Stdlib `imaplib` + `smtplib` under the hood, FastAPI on top, official MCP Python
   - [Secrets from the environment in config.yaml](#secrets-from-the-environment-in-configyaml)
 - [HTTP API](#http-api)
   - [Authentication](#authentication)
+  - [Moving messages](#moving-messages)
   - [Catch-all mailboxes](#catch-all-mailboxes)
   - [Drafts](#drafts)
   - [Reply](#reply)
@@ -34,7 +35,7 @@ Stdlib `imaplib` + `smtplib` under the hood, FastAPI on top, official MCP Python
 
 | Surface         | The goods                                                                                                                                       |
 | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| **HTTP API**    | `GET /inbox` fans out across every account at once (filter by mailbox, sender, subject, date, flags…). Per-mailbox reads + deletes. SMTP send, threaded replies, drafts. |
+| **HTTP API**    | `GET /inbox` fans out across every account at once (filter by mailbox, sender, subject, date, flags…). Per-mailbox reads, moves (spam, trash, archive) + deletes. SMTP send, threaded replies, drafts. |
 | **MCP server**  | Streamable-HTTP MCP at `/mcp` — same port, same bearer, same boss. A flat set of tools (`mailboxes`, `inbox`, `list_messages`, `send`, `reply`, `save_draft`, …) that take `mailbox` as a parameter. 100 accounts? Still one tool catalog. |
 | **Bearer auth** | One token list guards both the API and `/mcp`. No tokens = the server refuses to start, unless you explicitly say `MAILBOX_ALLOW_NO_AUTH=true`. Multiple tokens = zero-downtime rotation. |
 | **Catch-all aware** | Every fetched message says which of your addresses it was sent to (`received_for`), `reply` answers from that address, and a per-mailbox `allowed_from` list stops anything going out as an address you didn't approve. |
@@ -373,8 +374,55 @@ When you want to zero in on one account:
 | `GET`    | `/mailboxes/{name}/messages/{uid}?folder=&reader=`    | One message, fully decoded (`body_text` + `body_html` + attachment metadata), with its threading and delivery headers and [`received_for`](#catch-all-mailboxes). Add `reader=true` to also get `body_reader` — HTML stripped to clean text/markdown (no tables, styles, tracking pixels). |
 | `DELETE` | `/mailboxes/{name}/messages/{uid}?folder=`            | `\Deleted` + EXPUNGE. Gone. Really gone. One UID per call — ranges like `1:*` are refused.                                  |
 | `POST`   | `/mailboxes/{name}/messages/{uid}/seen?folder=`       | Body `{"seen": true|false}` — flip the `\Seen` flag.                                                                        |
+| `POST`   | `/mailboxes/{name}/messages/move`                     | Move messages to another folder. See [Moving messages](#moving-messages).                                                   |
+| `POST`   | `/mailboxes/{name}/messages/spam`                     | Move messages to the Junk folder.                                                                                           |
 
 UIDs everywhere, never sequence numbers — identifiers stay stable when the mailbox shifts around under you.
+
+Reading a message never marks it read: bodies are fetched with `BODY.PEEK[]`, so `\Seen` changes only when you call `/seen` (or `mark_seen`).
+
+### Moving messages
+
+`POST /mailboxes/{name}/messages/move`:
+
+```json
+{
+  "uids":        ["1234", "1235"],
+  "from_folder": "INBOX",
+  "to_folder":   "junk"
+}
+```
+
+`from_folder` defaults to the mailbox's `default_folder` (`INBOX`). `to_folder` is a folder name as `/folders` lists it, or one of three roles that find the mailbox's own folder for the job:
+
+| Role      | Looks for                     | Then a folder named |
+| --------- | ----------------------------- | ------------------- |
+| `junk`    | SPECIAL-USE `\Junk`           | `Junk`, then `Spam` |
+| `trash`   | SPECIAL-USE `\Trash`          | `Trash`             |
+| `archive` | SPECIAL-USE `\Archive`        | `Archive`           |
+
+Roles are case-insensitive, and a named folder counts at the top level or directly under `INBOX` (`INBOX.Junk` on Dovecot-style servers). No match is an error (`502`) rather than a guess — pass the folder's name instead.
+
+`POST /mailboxes/{name}/messages/spam` takes `{"uids", "from_folder"}` and is the same as moving to `junk`.
+
+Response:
+
+```json
+{
+  "from_folder": "INBOX",
+  "to_folder":   "Spam",
+  "method":      "MOVE",
+  "moved":       1,
+  "results": [
+    {"uid": "1234", "status": "moved"},
+    {"uid": "1235", "status": "not_found"}
+  ]
+}
+```
+
+Each UID gets `moved`, `not_found`, or `error` with an `error` reason; one failure doesn't stop the rest. `to_folder` is the folder's real name. Up to 500 UIDs per call, single UIDs only (`1:*` is refused).
+
+How it moves: with IMAP `MOVE` (RFC 6851) when the server advertises it. Otherwise each message is copied, flagged `\Deleted`, and only those UIDs are expunged (`UID EXPUNGE`), so messages another client has flagged for deletion are left alone. A server with neither `MOVE` nor `UIDPLUS` can't expunge selectively, so there the originals stay behind flagged `\Deleted`, and `warnings` says so.
 
 ### Catch-all mailboxes
 
@@ -528,6 +576,8 @@ search                      # (mailbox, from, subject, since, ...)
 get_message                 # (mailbox, uid, reader=true → +body_reader) incl. received_for
 delete_message              # (mailbox, uid)
 mark_seen                   # (mailbox, uid, seen)
+move_message                # (mailbox, uids, to_folder, from_folder) — to_folder may be junk / trash / archive
+mark_spam                   # (mailbox, uids, from_folder) → the Junk folder
 send                        # (mailbox, to, subject, body_text/html, in_reply_to, references, ...)
 reply                       # (mailbox, uid, folder, body_text/html, from_address, draft)
 save_draft                  # (mailbox, to, subject, body_text/html, ...) → uid
