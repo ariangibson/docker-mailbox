@@ -70,8 +70,21 @@ _TIMEOUT = 30
 # RFC 6154 SPECIAL-USE attributes, and the folder name to assume when the
 # server advertises none and the config doesn't name one either.
 _SPECIAL_USE = {"drafts": ("\\drafts", "Drafts"), "sent": ("\\sent", "Sent")}
-_LIST_RE = re.compile(r'^\((?P<flags>[^)]*)\)\s+(?:"(?:[^"\\]|\\.)*"|NIL)\s+(?P<name>.*)$')
+# `move_messages` destinations that name a folder by its role: the SPECIAL-USE
+# attribute to look for, then the folder names to try, in order, when no
+# folder carries it.
+_MOVE_ROLES = {
+    "junk": ("\\Junk", ("Junk", "Spam")),
+    "trash": ("\\Trash", ("Trash",)),
+    "archive": ("\\Archive", ("Archive",)),
+}
+# Most messages one move request may name (the same ceiling as `limit`).
+MAX_MOVE = 500
+_LIST_RE = re.compile(
+    r'^\((?P<flags>[^)]*)\)\s+(?:"(?P<delim>(?:[^"\\]|\\.)*)"|NIL)\s+(?P<name>.*)$'
+)
 _APPENDUID_RE = re.compile(rb"\[APPENDUID\s+\d+\s+(\d+)\]", re.IGNORECASE)
+_FETCH_UID_RE = re.compile(rb"\bUID (\d+)")
 
 
 def _reject_control_chars(value: str, field: str) -> None:
@@ -186,9 +199,12 @@ def _capabilities(conn: imaplib.IMAP4) -> set[str]:
     return {str(c).upper() for c in conn.capabilities}
 
 
-def _parse_list(data: list[Any]) -> list[tuple[set[str], str]]:
-    """LIST response lines as (lower-cased attributes, mailbox name) pairs."""
-    out: list[tuple[set[str], str]] = []
+def _parse_list(data: list[Any]) -> list[tuple[set[str], str, str]]:
+    """LIST response lines as (lower-cased attributes, delimiter, mailbox name).
+
+    The delimiter is "" when the server has no hierarchy (`NIL`).
+    """
+    out: list[tuple[set[str], str, str]] = []
     for raw in data or []:
         if not raw:
             continue
@@ -206,28 +222,75 @@ def _parse_list(data: list[Any]) -> list[tuple[set[str], str]]:
         elif len(name) >= 2 and name[0] == name[-1] == '"':
             name = re.sub(r"\\(.)", r"\1", name[1:-1])
         if name:
-            out.append(({f.lower() for f in m.group("flags").split()}, name))
+            delim = re.sub(r"\\(.)", r"\1", m.group("delim") or "")
+            out.append(({f.lower() for f in m.group("flags").split()}, delim, name))
     return out
 
 
-def _special_folder(conn: imaplib.IMAP4, kind: str, configured: str | None) -> str:
-    """Resolve the Drafts / Sent folder: SPECIAL-USE, then config, then the default."""
-    attr, default = _SPECIAL_USE[kind]
-
-    def _flagged(data: list[Any]) -> str | None:
-        return next((name for flags, name in _parse_list(data) if attr in flags), None)
-
+def _list_all(conn: imaplib.IMAP4) -> list[tuple[set[str], str, str]]:
     typ, data = conn.list()
     if typ != "OK":
         raise ImapError("LIST failed")
-    found = _flagged(data)
+    return _parse_list(data)
+
+
+def _flagged_folder(
+    conn: imaplib.IMAP4, attr: str, entries: list[tuple[set[str], str, str]]
+) -> str | None:
+    """The folder carrying SPECIAL-USE attribute `attr` (lower-case), if any."""
+
+    def _flagged(found: list[tuple[set[str], str, str]]) -> str | None:
+        return next((name for flags, _, name in found if attr in flags), None)
+
+    found = _flagged(entries)
     if found is None and {"SPECIAL-USE", "LIST-EXTENDED"} <= _capabilities(conn):
         # RFC 6154 lets a server leave the attributes out of a plain LIST and
         # only return them when asked for explicitly.
         typ, data = conn.list('""', '"*" RETURN (SPECIAL-USE)')
         if typ == "OK":
-            found = _flagged(data)
-    return found or configured or default
+            found = _flagged(_parse_list(data))
+    return found
+
+
+def _special_folder(conn: imaplib.IMAP4, kind: str, configured: str | None) -> str:
+    """Resolve the Drafts / Sent folder: SPECIAL-USE, then config, then the default."""
+    attr, default = _SPECIAL_USE[kind]
+    return _flagged_folder(conn, attr, _list_all(conn)) or configured or default
+
+
+def _named_folder(entries: list[tuple[set[str], str, str]], names: tuple[str, ...]) -> str | None:
+    """The first of `names` that exists, top-level or directly under INBOX.
+
+    Case-insensitive. Servers that keep every folder under INBOX (Dovecot's
+    `INBOX.` namespace) list Junk as `INBOX.Junk`; a folder nested anywhere
+    else (`Projects/Archive`) is somebody's own and doesn't count.
+    """
+    for want in names:
+        for flags, delim, name in entries:
+            if flags & {"\\noselect", "\\nonexistent"}:
+                continue
+            candidates = {want.lower()}
+            if delim:
+                candidates.add(f"inbox{delim}{want}".lower())
+            if name.lower() in candidates:
+                return name
+    return None
+
+
+def _move_target(conn: imaplib.IMAP4, to_folder: str) -> str:
+    """`to_folder` itself, or the folder a role name (junk / trash / archive) stands for."""
+    role = _MOVE_ROLES.get(to_folder.strip().lower())
+    if role is None:
+        return to_folder
+    attr, names = role
+    entries = _list_all(conn)
+    found = _flagged_folder(conn, attr.lower(), entries) or _named_folder(entries, names)
+    if found is None:
+        raise ImapError(
+            f"no {to_folder.strip().lower()} folder: none is flagged {attr} and none is "
+            f"named {' or '.join(names)} — pass the folder's name instead"
+        )
+    return found
 
 
 def list_folders(cfg: ImapConfig) -> list[str]:
@@ -442,7 +505,9 @@ def _extract_flags(meta: str) -> list[str]:
 
 
 def _fetch_raw(conn: imaplib.IMAP4, uid: str) -> bytes:
-    typ, data = conn.uid("FETCH", uid, "(RFC822)")
+    # BODY.PEEK[], not RFC822 / BODY[]: those set \Seen as a side effect,
+    # so merely reading a message would mark it read for every other client.
+    typ, data = conn.uid("FETCH", uid, "(BODY.PEEK[])")
     if typ != "OK" or not data or not isinstance(data[0], tuple):
         raise ImapError(f"could not fetch UID {uid}")
     raw = data[0][1]
@@ -585,6 +650,140 @@ def delete_message(cfg: ImapConfig, uid: str, folder: str | None = None) -> None
         if typ != "OK":
             raise ImapError(f"STORE \\Deleted failed for UID {uid}")
         conn.expunge()
+
+
+# ── Move ────────────────────────────────────────────────────────────────────
+
+
+def _same_folder(a: str, b: str) -> bool:
+    # INBOX is the one case-insensitive name (RFC 3501 §5.1).
+    return a == b or a.upper() == b.upper() == "INBOX"
+
+
+def _existing_uids(conn: imaplib.IMAP4, uids: list[str]) -> set[str]:
+    """Which of `uids` exist in the selected folder."""
+    typ, data = conn.uid("FETCH", ",".join(uids), "(FLAGS)")
+    if typ != "OK":
+        raise ImapError("FETCH failed")
+    found: set[str] = set()
+    for item in data or []:
+        raw = item[0] if isinstance(item, tuple) else item
+        m = _FETCH_UID_RE.search(raw) if isinstance(raw, bytes) else None
+        if m is not None:
+            found.add(m.group(1).decode("ascii"))
+    return found
+
+
+def move_messages(
+    cfg: ImapConfig,
+    uids: list[str],
+    to_folder: str,
+    from_folder: str | None = None,
+) -> dict[str, Any]:
+    """Move messages from one folder to another, reporting on each UID.
+
+    `to_folder` may be a role instead of a name — `junk`, `trash` or
+    `archive` — resolved through SPECIAL-USE, then common folder names.
+    Uses MOVE (RFC 6851) when the server has it. Otherwise each message is
+    COPYed, flagged \\Deleted, and the copied UIDs alone are removed with UID
+    EXPUNGE; a server without UIDPLUS can't do that, so there the originals
+    stay flagged \\Deleted (and a warning says so) rather than a bare EXPUNGE
+    purging other messages along with them.
+
+    Returns `{"from_folder", "to_folder", "method", "moved", "results"}`, plus
+    `warnings` when there are any. Each result is `{"uid", "status"}` with
+    status `moved`, `not_found` or `error` (the last with an `error` reason).
+    """
+    from_folder = from_folder or cfg.default_folder
+    _reject_control_chars(from_folder, "folder")
+    _reject_control_chars(to_folder, "folder")
+    if not to_folder.strip():
+        raise ImapError("to_folder is required")
+    if not uids:
+        raise ImapError("no uids given")
+    for uid in uids:
+        # Single UIDs only: a sequence-set (`1:*`) would move a whole folder.
+        _validate_single_uid(uid)
+    wanted = list(dict.fromkeys(str(int(uid)) for uid in uids))
+    if len(wanted) > MAX_MOVE:
+        raise ImapError(f"at most {MAX_MOVE} messages can be moved at once")
+
+    with _connect(cfg) as conn:
+        dest = _move_target(conn, to_folder)
+        if _same_folder(dest, from_folder):
+            raise ImapError(f"the messages are already in {dest!r}")
+        quoted = _quote(dest)
+        _select(conn, from_folder, readonly=False)
+        present = _existing_uids(conn, wanted)
+        caps = _capabilities(conn)
+        method = "MOVE" if "MOVE" in caps else "COPY"
+
+        def _run(*args: str) -> str | None:
+            """One UID command: None if it worked, else why not."""
+            try:
+                typ, data = conn.uid(*args)
+            except imaplib.IMAP4.error as e:
+                return redact(str(e), cfg.password)
+            if typ == "OK":
+                return None
+            detail = data[-1] if data else None
+            if isinstance(detail, bytes):
+                return detail.decode("utf-8", errors="replace") or typ
+            return typ
+
+        results: dict[str, dict[str, Any]] = {}
+        copied: list[str] = []
+        for uid in wanted:
+            if uid not in present:
+                results[uid] = {"uid": uid, "status": "not_found"}
+                continue
+            if method == "MOVE":
+                err = _run("MOVE", uid, quoted)
+            else:
+                err = _run("COPY", uid, quoted)
+                if err is None:
+                    err = _run("STORE", uid, "+FLAGS", r"(\Deleted)")
+                    if err is not None:
+                        err = f"copied, but the original could not be flagged \\Deleted: {err}"
+                    else:
+                        copied.append(uid)
+            if err is None:
+                results[uid] = {"uid": uid, "status": "moved"}
+            else:
+                results[uid] = {"uid": uid, "status": "error", "error": err}
+
+        warnings: list[str] = []
+        if copied and "UIDPLUS" in caps:
+            err = _run("EXPUNGE", ",".join(copied))
+            if err is not None:
+                for uid in copied:
+                    results[uid] = {
+                        "uid": uid,
+                        "status": "error",
+                        "error": f"copied and flagged \\Deleted, but not expunged: {err}",
+                    }
+        elif copied:
+            warnings.append(
+                "the server supports neither MOVE nor UID EXPUNGE: the originals were "
+                "copied and flagged \\Deleted, but left in place so that expunging them "
+                "would not purge other deleted messages too"
+            )
+
+    out: dict[str, Any] = {
+        "from_folder": from_folder,
+        "to_folder": dest,
+        "method": method,
+        "moved": sum(1 for r in results.values() if r["status"] == "moved"),
+        "results": [results[uid] for uid in wanted],
+    }
+    if warnings:
+        out["warnings"] = warnings
+    return out
+
+
+def mark_spam(cfg: ImapConfig, uids: list[str], from_folder: str | None = None) -> dict[str, Any]:
+    """Move messages to the Junk folder (see `move_messages`)."""
+    return move_messages(cfg, uids, "junk", from_folder=from_folder)
 
 
 # ── Drafts / Sent ───────────────────────────────────────────────────────────

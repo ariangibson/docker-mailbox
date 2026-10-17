@@ -6,6 +6,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from .imap_client import MAX_MOVE
+
 
 class HealthResponse(BaseModel):
     ok: bool
@@ -95,6 +97,18 @@ class ReplyRequest(BaseModel):
     body_html: str | None = None
     from_address: str | None = None
     draft: bool = False
+
+
+class MoveRequest(BaseModel):
+    uids: list[str] = Field(..., min_length=1, max_length=MAX_MOVE)
+    from_folder: str | None = None
+    # A folder name, or a role: `junk`, `trash` or `archive`.
+    to_folder: str = Field(..., min_length=1)
+
+
+class SpamRequest(BaseModel):
+    uids: list[str] = Field(..., min_length=1, max_length=MAX_MOVE)
+    from_folder: str | None = None
 
 
 class SendResponse(BaseModel):

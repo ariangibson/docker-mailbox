@@ -15,6 +15,8 @@ URL shape:
   GET    /mailboxes/{name}/messages/{uid}?folder=
   DELETE /mailboxes/{name}/messages/{uid}?folder=
   POST   /mailboxes/{name}/messages/{uid}/seen        body: {"seen": bool}
+  POST   /mailboxes/{name}/messages/move              body: {"uids", "to_folder", "from_folder"}
+  POST   /mailboxes/{name}/messages/spam              body: {"uids", "from_folder"}
   POST   /mailboxes/{name}/messages/{uid}/reply?folder=   body: {"body_text", "draft", ...}
   POST   /mailboxes/{name}/send                       (SMTP)
   GET    /mailboxes/{name}/drafts?limit=              (IMAP)
@@ -43,6 +45,8 @@ from .imap_client import delete_message as imap_delete
 from .imap_client import list_folders as imap_list_folders
 from .imap_client import list_messages as imap_list_messages
 from .imap_client import mark_seen as imap_mark_seen
+from .imap_client import mark_spam as imap_mark_spam
+from .imap_client import move_messages as imap_move_messages
 from .imap_client import search_messages as imap_search_messages
 from .imap_client import unified_search as imap_unified_search
 from .mcp_server import build_session_manager, mcp_lifespan
@@ -54,8 +58,10 @@ from .schemas import (
     HealthResponse,
     MailboxList,
     MailboxSummary,
+    MoveRequest,
     ReplyRequest,
     SendRequest,
+    SpamRequest,
 )
 from .smtp_client import SmtpError
 
@@ -423,6 +429,27 @@ def create_app(config: Config | None = None) -> FastAPI:
         except ImapError as e:
             raise HTTPException(status_code=502, detail=str(e)) from e
         return GenericOK()
+
+    @app.post("/mailboxes/{name}/messages/move")
+    def move_msgs(name: str = Path(...), req: MoveRequest = Body(...)) -> dict[str, Any]:
+        mb = _resolve(cfg, name)
+        _need(mb, "imap")
+        with _mail_errors():
+            return imap_move_messages(
+                mb.imap,  # type: ignore[arg-type]
+                req.uids,
+                req.to_folder,
+                from_folder=req.from_folder,
+            )
+
+    @app.post("/mailboxes/{name}/messages/spam")
+    def spam_msgs(name: str = Path(...), req: SpamRequest = Body(...)) -> dict[str, Any]:
+        mb = _resolve(cfg, name)
+        _need(mb, "imap")
+        with _mail_errors():
+            return imap_mark_spam(
+                mb.imap, req.uids, from_folder=req.from_folder  # type: ignore[arg-type]
+            )
 
     # ── SMTP ────────────────────────────────────────────────────────────────
 

@@ -22,11 +22,13 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
 from . import __version__, ops
 from .config import Config, MailboxConfig
-from .imap_client import ImapError
+from .imap_client import MAX_MOVE, ImapError
 from .imap_client import delete_message as imap_delete
 from .imap_client import list_folders as imap_list_folders
 from .imap_client import list_messages as imap_list_messages
 from .imap_client import mark_seen as imap_mark_seen
+from .imap_client import mark_spam as imap_mark_spam
+from .imap_client import move_messages as imap_move_messages
 from .imap_client import search_messages as imap_search_messages
 from .imap_client import unified_search as imap_unified_search
 from .smtp_client import SmtpError
@@ -435,6 +437,83 @@ def _register_imap_tools(
         return {"ok": True}
 
     handlers["mark_seen"] = _seen
+
+    _move_props: dict[str, Any] = {
+        "mailbox": _MAILBOX_ARG,
+        "uids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": MAX_MOVE,
+            "description": "UIDs of the messages to move, all from `from_folder`.",
+        },
+        "from_folder": {
+            "type": "string",
+            "description": "Folder the messages are in (default INBOX).",
+        },
+    }
+
+    tools.append(
+        types.Tool(
+            name="move_message",
+            description=(
+                "Move one or more messages to another folder. `to_folder` is a "
+                "folder name (see `list_folders`) or one of the roles `junk`, "
+                "`trash`, `archive`, which find the mailbox's own folder for "
+                "that purpose. Returns the destination's real name and a result "
+                "per UID: `moved`, `not_found`, or `error` with a reason."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    **_move_props,
+                    "to_folder": {
+                        "type": "string",
+                        "description": "Destination folder name, or `junk` / `trash` / `archive`.",
+                    },
+                },
+                "required": ["mailbox", "uids", "to_folder"],
+                "additionalProperties": False,
+            },
+        )
+    )
+
+    def _move(args: dict[str, Any], _c: Config = cfg) -> dict[str, Any]:
+        mb = _resolve_mailbox(_c, str(args["mailbox"]))
+        return imap_move_messages(
+            _require_imap(mb),
+            [str(u) for u in args["uids"]],
+            str(args["to_folder"]),
+            from_folder=args.get("from_folder"),
+        )
+
+    handlers["move_message"] = _move
+
+    tools.append(
+        types.Tool(
+            name="mark_spam",
+            description=(
+                "Move one or more messages to the mailbox's Junk folder — the "
+                "same as `move_message` with `to_folder: junk`."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": _move_props,
+                "required": ["mailbox", "uids"],
+                "additionalProperties": False,
+            },
+        )
+    )
+
+    def _spam(args: dict[str, Any], _c: Config = cfg) -> dict[str, Any]:
+        mb = _resolve_mailbox(_c, str(args["mailbox"]))
+        return imap_mark_spam(
+            _require_imap(mb),
+            [str(u) for u in args["uids"]],
+            from_folder=args.get("from_folder"),
+        )
+
+    handlers["mark_spam"] = _spam
 
 
 def _register_smtp_tools(

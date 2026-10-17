@@ -4,7 +4,7 @@ Hand-rolled on `socketserver` (same approach as the SMTP capture sink in
 `test_smtp_integration.py`) rather than a container, so the suite has no
 external moving parts and starts in milliseconds. It speaks just enough of
 IMAP4rev1 for `mailboxd.imap_client` to drive it: CAPABILITY, LOGIN, LIST,
-SELECT/EXAMINE, APPEND, UID SEARCH/FETCH/STORE/EXPUNGE and EXPUNGE, including
+SELECT/EXAMINE, APPEND, UID SEARCH/FETCH/STORE/COPY/MOVE/EXPUNGE and EXPUNGE, including
 the `{N}` literal framing imaplib needs to parse FETCH bodies and send APPEND
 ones.
 
@@ -45,6 +45,8 @@ class Sink:
         self.greeting = "* OK [CAPABILITY IMAP4rev1] mock ready"
         # Every APPEND accepted: (folder, flags, raw message).
         self.appended: list[tuple[str, str, bytes]] = []
+        # UIDs that UID COPY / UID MOVE answer `NO` for.
+        self.refuse: set[int] = set()
         self._next_uid = 100
         self._deleted: set[tuple[int, int]] = set()
 
@@ -199,26 +201,51 @@ def _make_handler(sink: Sink) -> type[socketserver.StreamRequestHandler]:
                 self._send(f"* 1 FETCH (UID {uid} FLAGS (\\Deleted))")
                 self._ok(tag, "UID STORE completed")
             elif sub == "EXPUNGE":
-                self._expunge(int(args) if args.isdigit() else None)
+                for uid in _parse_uid_set(args):
+                    self._expunge(uid)
                 self._ok(tag, "UID EXPUNGE completed")
+            elif sub in ("COPY", "MOVE"):
+                self._handle_copy(tag, sub, args)
             else:
                 self._ok(tag, f"UID {sub} completed")
 
+        def _handle_copy(self, tag: str, sub: str, args: str) -> None:
+            uid_set, _, folder = args.partition(" ")
+            name = _unquote(folder)
+            if name in sink.missing:
+                self._send(f"{tag} NO [TRYCREATE] no such mailbox")
+                return
+            uids = [u for u in _parse_uid_set(uid_set) if u in self.store]
+            if any(u in sink.refuse for u in uids):
+                self._send(f"{tag} NO refused by the mock")
+                return
+            dest = sink.folders.setdefault(name, {})
+            for uid in uids:
+                dest[sink._next_uid] = self.store[uid]
+                sink._next_uid += 1
+                if sub == "MOVE":
+                    self.store.pop(uid)
+                    self._send("* 1 EXPUNGE")
+            self._ok(tag, f"UID {sub} completed")
+
         def _handle_fetch(self, tag: str, args: str) -> None:
             uid_set, _, items = args.partition(" ")
-            want_full = "RFC822" in items and "HEADER" not in items
+            want_full = "BODY.PEEK[]" in items or ("RFC822" in items and "HEADER" not in items)
             for uid in _parse_uid_set(uid_set):
                 raw = self.store.get(uid)
                 if raw is None:
                     continue
                 if want_full:
                     self._fetch_full(uid, raw)
+                elif items == "(FLAGS)":
+                    flags = "\\Deleted" if (id(self.store), uid) in sink._deleted else ""
+                    self._send(f"* {uid} FETCH (UID {uid} FLAGS ({flags}))")
                 else:
                     self._fetch_headers(uid, raw)
             self._ok(tag, "UID FETCH completed")
 
         def _fetch_full(self, uid: int, raw: bytes) -> None:
-            head = b"* %d FETCH (UID %d RFC822 {%d}\r\n" % (uid, uid, len(raw))
+            head = b"* %d FETCH (UID %d BODY[] {%d}\r\n" % (uid, uid, len(raw))
             self.wfile.write(head + raw + b")\r\n")
 
         def _fetch_headers(self, uid: int, raw: bytes) -> None:
